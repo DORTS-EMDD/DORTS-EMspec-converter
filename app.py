@@ -471,13 +471,12 @@ if uploaded_files:
     kb_text = st.session_state.get("kb_text_cache", "")
 
 # ══════════════════════════════════════════════════════════
-# 主畫面（分頁式，上下切換取代左右並排）
+# 主畫面（上：輸入區 / 下：結果區，不分頁以免需要手動切換）
 # ══════════════════════════════════════════════════════════
 st.markdown("---")
-tab_input, tab_output = st.tabs(["📝 ① 上傳與萃取", "✨ ② 智慧改寫結果"])
 
-with tab_input:
-    st.subheader("📝 上傳 預修改之PTS")
+with st.container():
+    st.subheader("📝 ① 上傳 預修改之PTS")
 
     tab_pdf, tab_paste, tab_img = st.tabs([
         "📄 上傳 PDF（推薦）",
@@ -654,17 +653,18 @@ with tab_input:
                 st.success(f"✅ 即將萃取第 {auto_start} ～ {min(auto_end, total_pages)} 頁（共 {page_count_preview} 頁）")
 
             # 預設值（expander 未展開時使用）
-            page_start = auto_start
-            page_end   = min(auto_end, total_pages)
+            page_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
+            page_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
 
             with st.expander("🔧 手動調整頁碼範圍（選用）", expanded=False):
                 st.caption("若自動計算的頁碼範圍不正確，可在此手動修改")
                 c_s, c_e = st.columns(2)
+                _safe_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
+                _safe_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
                 with c_s:
-                    page_start = st.number_input("起始頁", 1, total_pages, auto_start)
+                    page_start = st.number_input("起始頁", 1, max(1, total_pages), _safe_start)
                 with c_e:
-                    page_end = st.number_input("結束頁", 1, total_pages,
-                                               min(auto_end, total_pages))
+                    page_end = st.number_input("結束頁", 1, max(1, total_pages), _safe_end)
                 page_count = page_end - page_start + 1
                 if page_count > 30:
                     st.warning(f"⚠️ 選取 {page_count} 頁，建議不超過 30 頁。")
@@ -729,10 +729,11 @@ with tab_input:
     clear_btn = st.button("✏️ 清除結果", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════
-# 分頁 ② ：輸出
+# 結果區（緊接在輸入區下方）
 # ══════════════════════════════════════════════════════════
-with tab_output:
-    st.subheader("✨ 智慧改寫草稿")
+st.markdown("---")
+with st.container():
+    st.subheader("✨ ② 智慧改寫草稿")
 
     if clear_btn:
         st.session_state.result_text = ""
@@ -827,7 +828,6 @@ with tab_output:
                     st.error("❌ 已超過重試次數，請稍後手動重試。")
 
             st.session_state.running = False
-            st.info("✅ 改寫完成！請切換到「✨ ② 智慧改寫結果」分頁查看結果。")
             st.rerun()
 
     if st.session_state.result_text:
