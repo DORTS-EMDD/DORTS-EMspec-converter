@@ -8,6 +8,7 @@ import io
 import time
 import base64
 import re
+import datetime
 
 # ── 頁面設定 ──────────────────────────────────────────────
 st.set_page_config(page_title="未來線中運量機電特別技術規範 - 智慧改寫平台", layout="wide")
@@ -24,8 +25,10 @@ for key, val in [
     ("chapter_id", ""),
     ("next_chapter_id", ""),
     ("cf620_pdf_name", ""),
-    ("kb_cache_key", None),      # 精進文件快取 key
-    ("kb_text_cache", ""),       # 精進文件快取內容
+    ("kb_cache_key", None),
+    ("kb_text_cache", ""),
+    ("rewrite_history", []),          # 歷史紀錄：list of {ts, label, text, old_text}
+    ("current_old_text_snapshot", ""),# 最新一次改寫時的原文快照
 ]:
     if key not in st.session_state:
         st.session_state[key] = val
@@ -738,6 +741,8 @@ with st.container():
     if clear_btn:
         st.session_state.result_text = ""
         st.session_state.extracted_old_text = ""
+        st.session_state.rewrite_history = []
+        st.session_state.current_old_text_snapshot = ""
         st.rerun()
 
     if run_btn:
@@ -804,186 +809,224 @@ with st.container():
 === 五、專業意見與注意事項 ===
 （每項以「💡」開頭，各項間空一行）
 """
-            with st.spinner(f"⏳ 使用 {selected_model} 改寫中..."):
-                retries, success = 3, False
-                while not success and retries > 0:
-                    try:
-                        genai.configure(api_key=api_key)
-                        model = genai.GenerativeModel(selected_model)
-                        response = model.generate_content(prompt)
-                        st.session_state.result_text = response.text
-                        success = True
-                    except Exception as e:
-                        err = str(e)
-                        if "429" in err or "quota" in err.lower():
-                            retries -= 1
-                            if retries > 0:
-                                st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
-                                time.sleep(15)
-                        elif "API_KEY_INVALID" in err or "api key" in err.lower():
-                            st.error("❌ API Key 無效。"); break
-                        else:
-                            st.error(f"❌ 錯誤：{err}"); break
-                if not success and retries == 0:
-                    st.error("❌ 已超過重試次數，請稍後手動重試。")
+            # ── 串流改寫 ──────────────────────────────────────
+            stream_box = st.empty()
+            retries, success, full_text = 3, False, ""
+            while not success and retries > 0:
+                try:
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel(selected_model)
+                    response = model.generate_content(prompt, stream=True)
+                    full_text = ""
+                    for chunk in response:
+                        try:
+                            full_text += chunk.text
+                            stream_box.markdown(full_text + " ▌")
+                        except Exception:
+                            pass
+                    stream_box.empty()
+                    st.session_state.result_text = full_text
+                    # ── 寫入歷史 ──────────────────────────────
+                    chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                    st.session_state.rewrite_history.insert(0, {
+                        "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
+                        "label":    chapter_label,
+                        "text":     full_text,
+                        "old_text": old_text,
+                    })
+                    st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                    st.session_state.current_old_text_snapshot = old_text
+                    success = True
+                except Exception as e:
+                    err = str(e)
+                    if "429" in err or "quota" in err.lower():
+                        retries -= 1
+                        if retries > 0:
+                            st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
+                            time.sleep(15)
+                    elif "API_KEY_INVALID" in err or "api key" in err.lower():
+                        st.error("❌ API Key 無效。"); break
+                    else:
+                        st.error(f"❌ 錯誤：{err}"); break
+            if not success and retries == 0:
+                st.error("❌ 已超過重試次數，請稍後手動重試。")
 
             st.session_state.running = False
             st.rerun()
 
     if st.session_state.result_text:
-        result_text = st.session_state.result_text
-        sections = result_text.split("===")
-        parsed = {}
-        for i in range(1, len(sections) - 1, 2):
-            title = sections[i].strip()
-            content = sections[i + 1].strip() if i + 1 < len(sections) else ""
-            parsed[title] = content
 
-        emoji_map = {"一": "📄", "二": "⚠️", "三": "🆕", "四": "🗑️", "五": "💡"}
-        if parsed:
-            for title, content in parsed.items():
-                emoji = emoji_map.get(title[0] if title else "", "📌")
-                with st.expander(f"{emoji} {title}", expanded=title.startswith("一")):
-                    # ── 渲染處理：Markdown 表格 → HTML 表格 + 段落換行 ────
-                    # Markdown 表格儲存格不支援換行，改用 HTML 表格確保條列正確顯示
-
-                    def parse_md_table_to_html(md_lines):
-                        """將連續的 Markdown 表格行轉換為 HTML 表格（支援儲存格內換行）"""
-                        html = ['<table border="1" style="border-collapse:collapse;width:100%;font-size:0.9em;">']
-                        is_header = True
-                        for row in md_lines:
-                            # 跳過分隔線
-                            if re.match(r"^\|[-:\s|]+\|$", row.strip()):
-                                is_header = False
-                                continue
-                            # 解析儲存格（去掉首尾 |，再 split）
-                            cells = [c.strip() for c in row.strip().strip("|").split("|")]
-                            tag = "th" if is_header else "td"
-                            style = "padding:6px 10px;vertical-align:top;border:1px solid #ccc;"
-                            if is_header:
-                                style += "background:#f0f0f0;font-weight:bold;"
-                            row_html = "<tr>" + "".join(
-                                f'<{tag} style="{style}">{format_cell(c)}</{tag}>'
-                                for c in cells
-                            ) + "</tr>"
-                            html.append(row_html)
-                        html.append("</table>")
-                        return "\n".join(html)
-
-                    def format_cell(text):
-                        """
-                        儲存格內容格式化：
-                        - 修正「1. xxx；2. yyy；3. zzz」時，原本第 1 點被當成前言，
-                          導致第 2 點在畫面上變成清單第 1 點的問題。
-                        - 將所有連續數字條列轉成同一個 <ol>，並保留原本第一個數字作為 start。
-                        """
-                        import html as html_mod
-
-                        if text is None:
-                            return ""
-
-                        text = str(text)
-                        text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                        text = text.replace("\r\n", "\n").replace("\r", "\n")
-                        text = re.sub(r"\s*；\s*", "；", text)
-
-                        # 找出條列編號，例如：1.、2.、3、，但排除 2.1、3.2.1 這類章節或小數。
-                        # 舊版 bug 是先用第一個分號切前言，導致「1. ...；2. ...」的第 1 點被當成前言，
-                        # 畫面上只剩第 2 點進入 <ol>，因此第 2 點會顯示成清單第 1 點。
-                        item_pat = re.compile(r"(?<![\d.])(\d{1,2})[.、]\s*(?!\d)")
-                        matches = list(item_pat.finditer(text))
-
-                        if matches:
-                            preamble = text[:matches[0].start()].strip("；; \n\t")
-                            items = []
-
-                            for idx, match in enumerate(matches):
-                                item_start = match.end()
-                                item_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-                                item_text = text[item_start:item_end].strip("；; \n\t")
-
-                                if item_text:
-                                    items.append(item_text)
-
-                            if items:
-                                first_number = matches[0].group(1)
-                                prefix = (
-                                    f"<p style='margin:0 0 4px 0;'>{html_mod.escape(preamble)}</p>"
-                                    if preamble else ""
-                                )
-                                li_items = "".join(
-                                    f"<li>{html_mod.escape(item).replace(chr(10), '<br>')}</li>"
-                                    for item in items
-                                )
-                                return (
-                                    f"{prefix}"
-                                    f"<ol start='{first_number}' style='margin:0;padding-left:1.4em;'>"
-                                    f"{li_items}"
-                                    f"</ol>"
-                                )
-
-                        return html_mod.escape(text).replace("\n", "<br>")
-
-
-                    # 逐行分組：表格行 vs 一般段落行
-                    lines = content.split("\n")
-                    output_parts = []   # 每個元素為 ("md", text) 或 ("table", [行列表])
-                    i = 0
-                    while i < len(lines):
-                        line = lines[i]
-                        stripped = line.strip()
-                        if stripped.startswith("|"):
-                            # 收集完整表格（包含後面緊接的空白行跳過，直到下一個 | 行）
-                            tbl_rows = []
-                            while i < len(lines) and (lines[i].strip().startswith("|") or
-                                  (not lines[i].strip() and i+1 < len(lines) and lines[i+1].strip().startswith("|"))):
-                                if lines[i].strip():
-                                    tbl_rows.append(lines[i].strip())
-                                i += 1
-                            output_parts.append(("table", tbl_rows))
-                        else:
-                            # 收集到下一個表格行或結束
-                            md_lines = []
-                            while i < len(lines) and not lines[i].strip().startswith("|"):
-                                md_lines.append(lines[i])
-                                i += 1
-                            output_parts.append(("md", md_lines))
-
-                    # 渲染各分組
-                    final_html_parts = []
-                    for part_type, part_data in output_parts:
-                        if part_type == "table":
-                            final_html_parts.append(parse_md_table_to_html(part_data))
-                        else:
-                            # 一般 Markdown 段落：補空行確保換行
-                            md_text = ""
-                            for ln in part_data:
-                                s = ln.strip()
-                                md_text += ln + "\n"
-                                if s and not s.startswith("---") and not s.startswith("|"):
-                                    md_text += "\n"
-                            if md_text.strip():
-                                # 轉為 HTML 段落（保留 Markdown 格式）
-                                import html as html_mod
-                                # 直接用 st.markdown 輸出非表格部分
-                                final_html_parts.append(f"MARKDOWN_BLOCK:{md_text}")
-
-                    # 輸出：HTML 表格用 st.markdown(unsafe_allow_html=True)，
-                    # Markdown 段落仍用 st.markdown
-                    for part in final_html_parts:
-                        if part.startswith("MARKDOWN_BLOCK:"):
-                            st.markdown(part[len("MARKDOWN_BLOCK:"):])
-                        else:
-                            st.markdown(part, unsafe_allow_html=True)
+        # ── 歷史記錄選擇器 ────────────────────────────────────
+        history = st.session_state.rewrite_history
+        if len(history) > 1:
+            history_labels = [
+                f"第{i+1}版　{h['ts']}　{h['label']}"
+                for i, h in enumerate(history)
+            ]
+            sel_label = st.selectbox(
+                "📋 歷史版本",
+                history_labels,
+                index=0,
+                key="history_select",
+            )
+            sel_idx = history_labels.index(sel_label)
+            display_result  = history[sel_idx]["text"]
+            display_old     = history[sel_idx]["old_text"]
         else:
-            st.markdown(result_text)
+            display_result  = st.session_state.result_text
+            display_old     = st.session_state.get("current_old_text_snapshot", "")
+
+        # ── 新舊對照 / 一般模式切換 ──────────────────────────
+        compare_mode = st.toggle("📊 新舊對照模式（原文 ↔ 改寫）", key="compare_toggle")
+
+        if compare_mode:
+            # 取出 section 一 的改寫後條文
+            _secs = display_result.split("===")
+            _parsed_for_compare = {}
+            for _i in range(1, len(_secs) - 1, 2):
+                _parsed_for_compare[_secs[_i].strip()] = (
+                    _secs[_i + 1].strip() if _i + 1 < len(_secs) else ""
+                )
+            section_one_text = next(
+                (c for t, c in _parsed_for_compare.items() if t.startswith("一")),
+                display_result,
+            )
+            left_col, right_col = st.columns(2)
+            with left_col:
+                st.caption("📄 原始條文")
+                st.text_area(
+                    "原始", value=display_old or "（無原始條文快照）",
+                    height=600, disabled=True, label_visibility="collapsed",
+                    key="orig_view",
+                )
+            with right_col:
+                st.caption("✨ 改寫後條文（一、）")
+                st.text_area(
+                    "改寫", value=section_one_text,
+                    height=600, disabled=True, label_visibility="collapsed",
+                    key="rewrite_view",
+                )
+        else:
+            # ── 一般結構化顯示 ────────────────────────────────
+            result_text = display_result
+            sections = result_text.split("===")
+            parsed = {}
+            for i in range(1, len(sections) - 1, 2):
+                title = sections[i].strip()
+                content = sections[i + 1].strip() if i + 1 < len(sections) else ""
+                parsed[title] = content
+
+            emoji_map = {"一": "📄", "二": "⚠️", "三": "🆕", "四": "🗑️", "五": "💡"}
+            if parsed:
+                for title, content in parsed.items():
+                    emoji = emoji_map.get(title[0] if title else "", "📌")
+                    with st.expander(f"{emoji} {title}", expanded=title.startswith("一")):
+
+                        def parse_md_table_to_html(md_lines):
+                            html = ['<table border="1" style="border-collapse:collapse;width:100%;font-size:0.9em;">']
+                            is_header = True
+                            for row in md_lines:
+                                if re.match(r"^\|[-:\s|]+\|$", row.strip()):
+                                    is_header = False
+                                    continue
+                                cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                                tag = "th" if is_header else "td"
+                                style = "padding:6px 10px;vertical-align:top;border:1px solid #ccc;"
+                                if is_header:
+                                    style += "background:#f0f0f0;font-weight:bold;"
+                                row_html = "<tr>" + "".join(
+                                    f'<{tag} style="{style}">{format_cell(c)}</{tag}>'
+                                    for c in cells
+                                ) + "</tr>"
+                                html.append(row_html)
+                            html.append("</table>")
+                            return "\n".join(html)
+
+                        def format_cell(text):
+                            import html as html_mod
+                            if text is None:
+                                return ""
+                            text = str(text)
+                            text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                            text = text.replace("\r\n", "\n").replace("\r", "\n")
+                            text = re.sub(r"\s*；\s*", "；", text)
+                            item_pat = re.compile(r"(?<![\d.])(\d{1,2})[.、]\s*(?!\d)")
+                            matches = list(item_pat.finditer(text))
+                            if matches:
+                                preamble = text[:matches[0].start()].strip("；; \n\t")
+                                items = []
+                                for idx, match in enumerate(matches):
+                                    item_start = match.end()
+                                    item_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                                    item_text = text[item_start:item_end].strip("；; \n\t")
+                                    if item_text:
+                                        items.append(item_text)
+                                if items:
+                                    first_number = matches[0].group(1)
+                                    prefix = (
+                                        f"<p style='margin:0 0 4px 0;'>{html_mod.escape(preamble)}</p>"
+                                        if preamble else ""
+                                    )
+                                    li_items = "".join(
+                                        f"<li>{html_mod.escape(item).replace(chr(10), '<br>')}</li>"
+                                        for item in items
+                                    )
+                                    return (
+                                        f"{prefix}"
+                                        f"<ol start='{first_number}' style='margin:0;padding-left:1.4em;'>"
+                                        f"{li_items}"
+                                        f"</ol>"
+                                    )
+                            return html_mod.escape(text).replace("\n", "<br>")
+
+                        lines = content.split("\n")
+                        output_parts = []
+                        i = 0
+                        while i < len(lines):
+                            stripped = lines[i].strip()
+                            if stripped.startswith("|"):
+                                tbl_rows = []
+                                while i < len(lines) and (lines[i].strip().startswith("|") or
+                                      (not lines[i].strip() and i+1 < len(lines) and lines[i+1].strip().startswith("|"))):
+                                    if lines[i].strip():
+                                        tbl_rows.append(lines[i].strip())
+                                    i += 1
+                                output_parts.append(("table", tbl_rows))
+                            else:
+                                md_lines = []
+                                while i < len(lines) and not lines[i].strip().startswith("|"):
+                                    md_lines.append(lines[i])
+                                    i += 1
+                                output_parts.append(("md", md_lines))
+
+                        final_html_parts = []
+                        for part_type, part_data in output_parts:
+                            if part_type == "table":
+                                final_html_parts.append(parse_md_table_to_html(part_data))
+                            else:
+                                md_text = ""
+                                for ln in part_data:
+                                    s = ln.strip()
+                                    md_text += ln + "\n"
+                                    if s and not s.startswith("---") and not s.startswith("|"):
+                                        md_text += "\n"
+                                if md_text.strip():
+                                    final_html_parts.append(f"MARKDOWN_BLOCK:{md_text}")
+
+                        for part in final_html_parts:
+                            if part.startswith("MARKDOWN_BLOCK:"):
+                                st.markdown(part[len("MARKDOWN_BLOCK:"):])
+                            else:
+                                st.markdown(part, unsafe_allow_html=True)
+            else:
+                st.markdown(result_text)
 
         st.success("✅ 改寫完成！")
         dl_col1, dl_col2 = st.columns(2)
         with dl_col1:
             st.download_button(
                 "⬇️ 下載 Word 檔（.docx）",
-                data=result_to_docx(result_text),
+                data=result_to_docx(display_result),
                 file_name="未來線中運量_改寫結果.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
@@ -991,7 +1034,7 @@ with st.container():
         with dl_col2:
             st.download_button(
                 "⬇️ 下載純文字（.txt）",
-                data=result_text.encode("utf-8"),
+                data=display_result.encode("utf-8"),
                 file_name="未來線中運量_改寫結果.txt",
                 mime="text/plain",
                 use_container_width=True,
@@ -1037,27 +1080,43 @@ with st.container():
 - 不要輸出任何問候語或說明，直接輸出修改後的草稿
 - 一、改寫後條文 區塊內容必須乾淨，不得出現〔待確認〕、【建議刪除】等標記
 """
-                with st.spinner("⏳ AI 精修中..."):
-                    retries, success = 3, False
-                    while not success and retries > 0:
-                        try:
-                            genai.configure(api_key=api_key)
-                            model = genai.GenerativeModel(selected_model)
-                            response = model.generate_content(refine_prompt)
-                            st.session_state.result_text = response.text
-                            success = True
-                        except Exception as e:
-                            err = str(e)
-                            if "429" in err or "quota" in err.lower():
-                                retries -= 1
-                                if retries > 0:
-                                    st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
-                                    import time
-                                    time.sleep(15)
-                            else:
-                                st.error(f"❌ 錯誤：{err}"); break
-                    if not success and retries == 0:
-                        st.error("❌ 已超過重試次數，請稍後手動重試。")
+                stream_box2 = st.empty()
+                retries, success, full_text = 3, False, ""
+                while not success and retries > 0:
+                    try:
+                        genai.configure(api_key=api_key)
+                        model = genai.GenerativeModel(selected_model)
+                        response = model.generate_content(refine_prompt, stream=True)
+                        full_text = ""
+                        for chunk in response:
+                            try:
+                                full_text += chunk.text
+                                stream_box2.markdown(full_text + " ▌")
+                            except Exception:
+                                pass
+                        stream_box2.empty()
+                        st.session_state.result_text = full_text
+                        # 寫入歷史（精修版）
+                        chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                        st.session_state.rewrite_history.insert(0, {
+                            "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
+                            "label":    f"{chapter_label}（精修）",
+                            "text":     full_text,
+                            "old_text": st.session_state.get("current_old_text_snapshot", ""),
+                        })
+                        st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                        success = True
+                    except Exception as e:
+                        err = str(e)
+                        if "429" in err or "quota" in err.lower():
+                            retries -= 1
+                            if retries > 0:
+                                st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
+                                time.sleep(15)
+                        else:
+                            st.error(f"❌ 錯誤：{err}"); break
+                if not success and retries == 0:
+                    st.error("❌ 已超過重試次數，請稍後手動重試。")
                 if success:
                     st.success("✅ 精修完成！")
                     st.rerun()
