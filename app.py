@@ -458,13 +458,13 @@ if uploaded_files:
     st.sidebar.success(f"✅ 成功載入 {len(uploaded_files)} 份精進文件！")
 
 # ══════════════════════════════════════════════════════════
-# 主畫面
+# 主畫面（分頁式，上下切換取代左右並排）
 # ══════════════════════════════════════════════════════════
 st.markdown("---")
-col1, col2 = st.columns(2)
+tab_input, tab_output = st.tabs(["📝 ① 上傳與萃取", "✨ ② 智慧改寫結果"])
 
-with col1:
-    st.subheader("📝 ① 上傳 預修改之PTS")
+with tab_input:
+    st.subheader("📝 上傳 預修改之PTS")
 
     tab_pdf, tab_paste, tab_img = st.tabs([
         "📄 上傳 PDF（推薦）",
@@ -716,10 +716,10 @@ with col1:
     clear_btn = st.button("✏️ 清除結果", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════
-# 右欄：輸出
+# 分頁 ② ：輸出
 # ══════════════════════════════════════════════════════════
-with col2:
-    st.subheader("✨ ② 智慧改寫草稿")
+with tab_output:
+    st.subheader("✨ 智慧改寫草稿")
 
     if clear_btn:
         st.session_state.result_text = ""
@@ -758,8 +758,8 @@ with col2:
    - 每一個測試項目（如 A.車廂地板防火測試、B.車間走道防火測試）都必須是表格中獨立的一列（row），不得拆到表格外
    - 說明欄中若有多個子條件（1. 2. 3.…），全部寫在同一格內，子條件之間用「；」分隔，不得換行成表格外的條列
    - 禁止在表格行之間插入任何非表格文字或空行
-5. 優先採用精進文件中的最新中運量規格參數；若未提及，則保留原始數值並標註〔待確認〕。
-6. 不適用未來線中運量的設備或條款，保留完整條文內容並在結尾標註【建議刪除，或由機設處重新評估】。
+5. 優先採用精進文件中的最新中運量規格參數；若未提及，則保留原始數值，並將該條款編號與說明列入「=== 二、待確認事項 ===」，正文條文本體內不得出現〔待確認〕等標記。
+6. 不適用未來線中運量的設備或條款，保留完整條文內容，並將該條款編號與不適用原因列入「=== 二、待確認事項 ===」的「建議處理」小節，正文條文本體內不得出現【建議刪除，或由機設處重新評估】等標記。
 7. 每一條款之間必須空一行，保持段落清晰易讀；禁止將所有條文連成一段文字輸出。
 8. 【禁止使用 HTML 標籤】輸出中禁止使用 <br>、<br/>、<p> 等任何 HTML 標籤，段落換行只能用空行（換兩次 Enter）表示。
 9. 請勿輸出任何問候語，直接輸出以下四個區塊。{hint_section}{kb_section}
@@ -772,14 +772,22 @@ with col2:
 
 === 一、改寫後條文 ===
 （完整改寫版條文，保留編號格式，各條款間空一行，表格用 Markdown 呈現）
+（⚠️ 本區塊內容必須完全乾淨，禁止出現〔待確認〕、【建議刪除】等任何標記符號）
 
-=== 二、新增內容摘要 ===
+=== 二、待確認事項與建議處理項目 ===
+【❓ 待確認項目】
+（每項以「❓」開頭，格式：條款編號 → 待確認說明，各項間空一行）
+
+【⚠️ 建議刪除或由機設處重新評估】
+（每項以「⚠️」開頭，格式：條款編號 → 不適用原因，各項間空一行）
+
+=== 三、新增內容摘要 ===
 （每項以「▸」開頭，各項間空一行）
 
-=== 三、刪除 / 調整內容摘要 ===
+=== 四、刪除 / 調整內容摘要 ===
 （每項以「✕」開頭，各項間空一行）
 
-=== 四、專業意見與注意事項 ===
+=== 五、專業意見與注意事項 ===
 （每項以「💡」開頭，各項間空一行）
 """
             with st.spinner(f"⏳ 使用 {selected_model} 改寫中..."):
@@ -806,6 +814,7 @@ with col2:
                     st.error("❌ 已超過重試次數，請稍後手動重試。")
 
             st.session_state.running = False
+            st.info("✅ 改寫完成！請切換到「✨ ② 智慧改寫結果」分頁查看結果。")
             st.rerun()
 
     if st.session_state.result_text:
@@ -817,7 +826,7 @@ with col2:
             content = sections[i + 1].strip() if i + 1 < len(sections) else ""
             parsed[title] = content
 
-        emoji_map = {"一": "📄", "二": "🆕", "三": "🗑️", "四": "💡"}
+        emoji_map = {"一": "📄", "二": "⚠️", "三": "🆕", "四": "🗑️", "五": "💡"}
         if parsed:
             for title, content in parsed.items():
                 emoji = emoji_map.get(title[0] if title else "", "📌")
@@ -974,5 +983,70 @@ with col2:
                 mime="text/plain",
                 use_container_width=True,
             )
+
+        # ── 後續修改指令 ──────────────────────────────────────
+        st.markdown("---")
+        st.subheader("🔄 後續修改指令")
+        st.caption("針對上方改寫結果，輸入補充指令後，AI 將依指令進行二次精修")
+        post_hint = st.text_area(
+            "輸入修改指令",
+            height=120,
+            placeholder="例如：\n・請將第 3.1.2 條的電壓改為 750V DC\n・把第 3.2 條表格的測試時間全部改為 30 分鐘\n・幫我刪除第 3.3 條整條",
+            label_visibility="collapsed",
+            key="post_hint_area",
+        )
+        post_btn = st.button(
+            "🔄 依指令修改改寫結果",
+            use_container_width=True,
+            type="secondary",
+            disabled=st.session_state.running,
+        )
+
+        if post_btn:
+            if not post_hint or not post_hint.strip():
+                st.warning("⚠️ 請先輸入修改指令！")
+            elif not api_key:
+                st.error("⚠️ 請先在側欄輸入 Gemini API Key！")
+            else:
+                refine_prompt = f"""你是一位具備捷運機電系統工程與合約撰寫背景的資深專家。
+
+【任務】
+以下是一份已改寫完成的技術規範草稿，請依照「修改指令」對其進行調整，並完整保留未被指令影響的部分不變。
+
+【修改指令】
+{post_hint.strip()}
+
+【現有改寫草稿】
+{result_text}
+
+【輸出要求】
+- 請直接輸出修改後的完整草稿，格式與分區（=== 一、... === 二、... 等）保持不變
+- 不要輸出任何問候語或說明，直接輸出修改後的草稿
+- 一、改寫後條文 區塊內容必須乾淨，不得出現〔待確認〕、【建議刪除】等標記
+"""
+                with st.spinner("⏳ AI 精修中..."):
+                    retries, success = 3, False
+                    while not success and retries > 0:
+                        try:
+                            genai.configure(api_key=api_key)
+                            model = genai.GenerativeModel(selected_model)
+                            response = model.generate_content(refine_prompt)
+                            st.session_state.result_text = response.text
+                            success = True
+                        except Exception as e:
+                            err = str(e)
+                            if "429" in err or "quota" in err.lower():
+                                retries -= 1
+                                if retries > 0:
+                                    st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
+                                    import time
+                                    time.sleep(15)
+                            else:
+                                st.error(f"❌ 錯誤：{err}"); break
+                    if not success and retries == 0:
+                        st.error("❌ 已超過重試次數，請稍後手動重試。")
+                if success:
+                    st.success("✅ 精修完成！")
+                    st.rerun()
     else:
         st.info("尚未產出結果。")
