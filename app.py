@@ -18,12 +18,14 @@ for key, val in [
     ("extracted_old_text", ""),
     ("cf620_total_pages", 0),
     ("cf620_toc", []),
-    ("cf620_toc_raw", []),          # 邏輯頁碼（未套偏移）
-    ("cf620_detected_offset", 0),   # Gemini 自動偵測的偏移
+    ("cf620_toc_raw", []),
+    ("cf620_detected_offset", 0),
     ("pdf_bytes_cache", None),
     ("chapter_id", ""),
     ("next_chapter_id", ""),
     ("cf620_pdf_name", ""),
+    ("kb_cache_key", None),      # 精進文件快取 key
+    ("kb_text_cache", ""),       # 精進文件快取內容
 ]:
     if key not in st.session_state:
         st.session_state[key] = val
@@ -35,6 +37,7 @@ def set_running():
 # 工具函式
 # ══════════════════════════════════════════════════════════
 
+@st.cache_data(show_spinner=False)
 def detect_toc_pages(file_bytes, max_scan=20):
     """偵測前 max_scan 頁中目錄頁（章節編號密度高的頁面），回傳 page_no list（0-based）"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -48,6 +51,7 @@ def detect_toc_pages(file_bytes, max_scan=20):
     return toc_pages, len(doc)
 
 
+@st.cache_data(show_spinner=False)
 def render_page_to_png(file_bytes, page_no, dpi=150):
     """將 PDF 指定頁（0-based）render 成 PNG bytes"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -176,6 +180,7 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
     return toc, toc_raw, offset, total
 
 
+@st.cache_data(show_spinner=False)
 def extract_pages(file_bytes, page_start, page_end):
     """萃取指定頁碼範圍（1-based），保留表格結構，過濾頁首頁尾"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -264,8 +269,8 @@ def trim_to_chapter(text, chapter_id, next_chapter_id=None):
     return "\n".join(lines[start_idx:end_idx]).strip()
 
 
+@st.cache_data(show_spinner=False)
 def extract_pdf_with_tables(file_bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
     all_text = ""
     for page in doc:
         try:
@@ -445,17 +450,25 @@ with st.sidebar:
 
 kb_text = ""
 if uploaded_files:
-    for f in uploaded_files:
-        try:
-            if f.name.lower().endswith(".pdf"):
-                kb_text += extract_pdf_with_tables(f.read())
-            elif f.name.lower().endswith(".docx"):
-                wd = docx.Document(io.BytesIO(f.read()))
-                for para in wd.paragraphs:
-                    kb_text += para.text + "\n"
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ 無法讀取 {f.name}：{e}")
-    st.sidebar.success(f"✅ 成功載入 {len(uploaded_files)} 份精進文件！")
+    # 用檔名+大小當 cache key，只有真的換檔案才重新萃取
+    kb_cache_key = tuple((f.name, f.size) for f in uploaded_files)
+    if st.session_state.get("kb_cache_key") != kb_cache_key:
+        _kb = ""
+        for f in uploaded_files:
+            try:
+                raw = f.read()
+                if f.name.lower().endswith(".pdf"):
+                    _kb += extract_pdf_with_tables(raw)
+                elif f.name.lower().endswith(".docx"):
+                    wd = docx.Document(io.BytesIO(raw))
+                    for para in wd.paragraphs:
+                        _kb += para.text + "\n"
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ 無法讀取 {f.name}：{e}")
+        st.session_state["kb_text_cache"] = _kb
+        st.session_state["kb_cache_key"] = kb_cache_key
+        st.sidebar.success(f"✅ 成功載入 {len(uploaded_files)} 份精進文件！")
+    kb_text = st.session_state.get("kb_text_cache", "")
 
 # ══════════════════════════════════════════════════════════
 # 主畫面（分頁式，上下切換取代左右並排）
