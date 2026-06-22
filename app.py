@@ -1024,11 +1024,13 @@ with tab_result:
                         try:
                             full_text += chunk.text
                             chunk_count += 1
-                            progress_bar.progress(
-                                min(chunk_count / 80, 0.95),
-                                text=f"⏳ AI 改寫中… 已產出 {len(full_text):,} 字元"
-                            )
-                            stream_box.markdown(full_text + " ▌")
+                            # 每 6 個 chunk 才更新一次 UI，避免 DOM 頻繁重繪拖慢速度
+                            if chunk_count % 6 == 0:
+                                progress_bar.progress(
+                                    min(chunk_count / 80, 0.95),
+                                    text=f"⏳ AI 改寫中… 已產出 {len(full_text):,} 字元"
+                                )
+                                stream_box.markdown(full_text + " ▌")
                         except Exception:
                             pass
                     progress_bar.progress(1.0, text="✅ 改寫完成！")
@@ -1308,10 +1310,13 @@ with tab_refine:
                         model = genai.GenerativeModel(selected_model)
                         response = model.generate_content(refine_prompt, stream=True)
                         full_text = ""
+                        _rc = 0
                         for chunk in response:
                             try:
                                 full_text += chunk.text
-                                stream_box2.markdown(full_text + " ▌")
+                                _rc += 1
+                                if _rc % 6 == 0:
+                                    stream_box2.markdown(full_text + " ▌")
                             except Exception:
                                 pass
                         stream_box2.empty()
