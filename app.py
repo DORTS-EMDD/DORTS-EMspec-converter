@@ -64,6 +64,70 @@ def render_page_to_png(file_bytes, page_no, dpi=150):
     return pix.tobytes("png")
 
 
+@st.cache_data(show_spinner=False)
+def build_printed_page_map(file_bytes):
+    """
+    【方案 A 核心】掃過全部頁面，從頁眉/頁尾抓「實際印刷頁碼」，
+    建立 {印刷頁碼: pdf_index(0-based)} 對照表。
+
+    PTS 文件頁眉/頁尾常見：
+      - "CF620/ 97"、"DF115/ 3" 這類「代號/頁碼」格式
+      - 單獨的阿拉伯數字頁碼
+      - 羅馬數字（前言常見，這裡略過不納入對照，避免污染正文頁碼）
+
+    回傳 dict；同一印刷頁碼若重複出現，以「第一次出現」為準。
+    """
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    # "CF620/ 97" → 取斜線後的數字當印刷頁碼
+    pat_code = re.compile(r'[A-Z]{2}\d{3}\s*/\s*(\d{1,4})')
+    # 單獨數字頁碼（整行只有一個數字）
+    pat_num  = re.compile(r'^\s*(\d{1,4})\s*$')
+
+    page_map = {}
+    for idx in range(len(doc)):
+        text = doc[idx].get_text("text")
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            continue
+        # 只看頁面上下緣（頁首前 3 行 + 頁尾後 3 行），降低誤抓內文數字
+        candidates = lines[:3] + lines[-3:]
+        printed = None
+        for ln in candidates:
+            m = pat_code.search(ln)
+            if m:
+                printed = int(m.group(1))
+                break
+            m = pat_num.match(ln)
+            if m:
+                # 過濾明顯不合理的純數字（避免抓到年份、條號等）
+                val = int(m.group(1))
+                if 1 <= val <= len(doc) + 50:
+                    printed = val
+                    break
+        if printed is not None and printed not in page_map:
+            page_map[printed] = idx  # 0-based
+    return page_map
+
+
+def make_to_abs(page_map):
+    """
+    依印刷頁碼對照表，建立「邏輯頁碼 → 絕對 PDF 頁碼(1-based)」轉換函式。
+    - 命中：直接查表（精確）
+    - 未命中：用最接近的已知錨點做局部線性插補
+    """
+    known = sorted(page_map)
+
+    def to_abs(logical_p):
+        if not known:
+            return logical_p
+        if logical_p in page_map:
+            return page_map[logical_p] + 1  # 命中：精確查表（1-based）
+        nearest = min(known, key=lambda k: abs(k - logical_p))
+        return page_map[nearest] + 1 + (logical_p - nearest)
+
+    return to_abs
+
+
 def detect_page_offset(api_key, model_name, file_bytes, toc_page_nos, first_logical_page):
     """
     計算 PDF 物理頁碼與目錄所列邏輯頁碼的偏移量。
@@ -171,16 +235,54 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
         level = min(dots + 1, 3)
         toc_raw.append([level, full_title, logical_p])
 
-    # ── 計算偏移，將邏輯頁碼轉為絕對 PDF 頁碼 ──────────────
-    first_logical = toc_raw[0][2] if toc_raw else 1
-    offset = detect_page_offset(api_key, model_name, file_bytes, toc_page_nos, first_logical)
+    # ══════════════════════════════════════════════════════
+    # 【方案 A】邏輯頁碼 → 絕對 PDF 頁碼：查表（治本），不再用單一 offset
+    # ══════════════════════════════════════════════════════
+    page_map = build_printed_page_map(file_bytes)
+    to_abs   = make_to_abs(page_map)
 
-    toc = [
-        [level, title, max(1, logical_p + offset)]
-        for level, title, logical_p in toc_raw
-    ]
+    if page_map:
+        # 有抓到印刷頁碼 → 逐筆查表 / 插補
+        toc = [
+            [level, title, max(1, min(to_abs(logical_p), total))]
+            for level, title, logical_p in toc_raw
+        ]
+        # 回傳「命中率」供 UI 顯示信心度
+        hit = sum(1 for _, _, lp in toc_raw if lp in page_map)
+        coverage = hit / len(toc_raw) if toc_raw else 0.0
+        offset = 0  # 已不使用 offset，保留欄位相容
+    else:
+        # 完全抓不到印刷頁碼 → 退回舊版單一 offset 法（保底）
+        first_logical = toc_raw[0][2] if toc_raw else 1
+        offset = detect_page_offset(api_key, model_name, file_bytes, toc_page_nos, first_logical)
+        toc = [
+            [level, title, max(1, logical_p + offset)]
+            for level, title, logical_p in toc_raw
+        ]
+        coverage = 0.0
 
-    return toc, toc_raw, offset, total
+    # ══════════════════════════════════════════════════════
+    # 【方案 C】異常偵測：頁碼超出範圍 / 嚴重非遞增 → 標記需校正
+    # ══════════════════════════════════════════════════════
+    anomalies = []
+    pages_only = [p for _, _, p in toc]
+    for i, (lv, title, p) in enumerate(toc):
+        if p < 1 or p > total:
+            anomalies.append(f"「{title}」頁碼 {p} 超出 1～{total} 範圍")
+    # 檢查嚴重逆序（後章節頁碼比前章節小很多）
+    for i in range(1, len(pages_only)):
+        if pages_only[i] < pages_only[i - 1] - 1:
+            anomalies.append(
+                f"「{toc[i][1]}」頁碼({pages_only[i]}) 小於前一章節({pages_only[i-1]})"
+            )
+            break
+    # 命中率過低也視為需人工確認
+    if toc_raw and coverage < 0.5 and page_map:
+        anomalies.append(f"自動比對命中率偏低（{coverage:.0%}），建議人工確認")
+
+    needs_review = len(anomalies) > 0
+
+    return toc, toc_raw, offset, total, page_map, coverage, needs_review, anomalies
 
 
 @st.cache_data(show_spinner=False)
@@ -275,6 +377,7 @@ def trim_to_chapter(text, chapter_id, next_chapter_id=None):
 @st.cache_data(show_spinner=False)
 def extract_pdf_with_tables(file_bytes):
     all_text = ""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     for page in doc:
         try:
             tables = page.find_tables()
@@ -415,45 +518,57 @@ def result_to_docx(result_text):
     doc.save(buf)
     buf.seek(0)
     return buf.getvalue()
+# ══════════════════════════════════════════════════════════
+# 標題 + 全域樣式（限寬置中，避免超寬螢幕字太散）
+# ══════════════════════════════════════════════════════════
+st.markdown(
+    """
+    <style>
+      .block-container {max-width: 1180px; padding-top: 1.2rem; padding-bottom: 2rem;}
+      div[data-testid="stExpander"] {border-radius: 10px;}
+      .stTabs [data-baseweb="tab-list"] {gap: 4px;}
+      .stTabs [data-baseweb="tab"] {height: 46px; font-size: 1.02rem; font-weight: 600;}
+      .pts-hint {background:#f6f8fa;border-left:4px solid #4c8bf5;padding:10px 14px;
+                 border-radius:6px;font-size:0.9rem;color:#444;margin-bottom:8px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ══════════════════════════════════════════════════════════
-# 標題
-# ══════════════════════════════════════════════════════════
 st.title("🚆 未來線中運量機電特別技術規範 - 智慧改寫平台")
+st.caption("運用 Gemini AI，將既有 PTS 條文改寫為未來線中運量系統版本 ｜ 三步驟：輸入 → 改寫 → 精修")
 
 # ══════════════════════════════════════════════════════════
-# 左側欄
+# 左側欄：只保留「系統設定 + 精進文件」，提示語移至主畫面
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
     st.header("⚙️ 系統設定")
-    api_key = st.text_input("🔑 輸入 Gemini API Key", type="password",
-                             help="https://aistudio.google.com/app/apikey")
+    api_key = st.text_input(
+        "🔑 Gemini API Key", type="password",
+        help="前往 https://aistudio.google.com/app/apikey 取得",
+    )
     selected_model = st.selectbox(
         "🤖 選擇模型",
         ["gemini-3.1-flash-lite", "gemini-3.5-flash"],
         index=0,
-        help="3.1-flash-lite：速度快、省配額，適合一般改寫。\n3.5-flash：細節保留較完整，建議用於重要章節。"
+        help="3.1-flash-lite：速度快、省配額，適合一般改寫。\n3.5-flash：細節保留較完整，建議用於重要章節。",
     )
+    if api_key:
+        st.success("✅ 已輸入 API Key", icon="🔑")
+    else:
+        st.info("請先輸入 API Key 以啟用辨識與改寫", icon="ℹ️")
 
     st.markdown("---")
-    st.header("📂 匯入精進文件")
-    st.caption("上傳未來線最新測試規定（PDF / Word）")
-    uploaded_files = st.file_uploader("選擇檔案（可多選）",
-        accept_multiple_files=True, type=["pdf", "docx"], key="kb_uploader")
-
-    st.markdown("---")
-    st.header("✏️ 額外提示語（選填）")
-    st.caption("可輸入改寫方向、特殊要求、精進文字（不上傳文件時直接貼上亦可），AI 改寫時將一併參考")
-    user_hint = st.text_area(
-        "提示語",
-        height=300,
-        placeholder="例如：\n・請特別注意電力系統改用 750V DC\n・保留所有測試步驟數值\n・或直接貼上精進文件全文（約 1000 字以內效果最佳）…",
-        label_visibility="collapsed"
+    st.header("📂 精進文件（選填）")
+    st.caption("上傳未來線最新測試規定（PDF / Word），AI 改寫時將優先採用其中參數")
+    uploaded_files = st.file_uploader(
+        "選擇檔案（可多選）",
+        accept_multiple_files=True, type=["pdf", "docx"], key="kb_uploader",
     )
 
+# ── 精進文件萃取（邏輯不變，只是搬到 sidebar 區塊外處理） ──
 kb_text = ""
 if uploaded_files:
-    # 用檔名+大小當 cache key，只有真的換檔案才重新萃取
     kb_cache_key = tuple((f.name, f.size) for f in uploaded_files)
     if st.session_state.get("kb_cache_key") != kb_cache_key:
         _kb = ""
@@ -473,149 +588,154 @@ if uploaded_files:
         st.sidebar.success(f"✅ 成功載入 {len(uploaded_files)} 份精進文件！")
     kb_text = st.session_state.get("kb_text_cache", "")
 
+with st.sidebar:
+    if kb_text:
+        st.caption(f"📑 目前精進文件約 {len(kb_text):,} 字")
+
 # ══════════════════════════════════════════════════════════
-# 主畫面（上：輸入區 / 下：結果區，不分頁以免需要手動切換）
+# 主流程：三個分頁（① 輸入 → ② 改寫結果 → ③ 精修）
 # ══════════════════════════════════════════════════════════
-st.markdown("---")
+tab_input, tab_result, tab_refine = st.tabs([
+    "　① 輸入待改寫條文　",
+    "　② 改寫結果　",
+    "　③ 二次精修　",
+])
 
-with st.container():
-    st.subheader("📝 ① 上傳 預修改之PTS")
+# ══════════════════════════════════════════════════════════
+# ① 輸入分頁
+# ══════════════════════════════════════════════════════════
+with tab_input:
+    in_main, in_side = st.columns([3, 2], gap="large")
 
-    tab_pdf, tab_paste, tab_img = st.tabs([
-        "📄 上傳 PDF（推薦）",
-        "✍️ 直接貼上文字",
-        "🖼️ 截圖辨識",
-    ])
+    # ── 左大欄：條文來源（PDF / 貼上 / 截圖） ──
+    with in_main:
+        st.subheader("📥 條文來源")
+        src_pdf, src_paste, src_img = st.tabs([
+            "📄 上傳 PDF（推薦）", "✍️ 直接貼上", "🖼️ 截圖辨識",
+        ])
 
-    # ── Tab 1：大型 PDF 選頁 ──────────────────────────────
-    with tab_pdf:
-        st.caption("💡 使用流程：上傳 PDF → 選擇章節 → 按「萃取內容」，即可自動擷取文字")
+        # ── 來源 1：大型 PDF 選頁 ──────────────────────────
+        with src_pdf:
+            st.markdown(
+                '<div class="pts-hint">💡 流程：上傳 PDF → 自動辨識目錄 → 選章節 → 萃取內容</div>',
+                unsafe_allow_html=True,
+            )
+            cf620_pdf = st.file_uploader("上傳 PTS 完整 PDF", type=["pdf"], key="cf620_big_pdf")
 
-        cf620_pdf = st.file_uploader(
-            "上傳 PTS 完整 PDF", type=["pdf"], key="cf620_big_pdf"
-        )
-
-        if cf620_pdf:
-            # ── 只在「新上傳」時重新偵測，其餘 rerun 直接用快取 ──
-            if cf620_pdf.name != st.session_state.cf620_pdf_name:
-                pdf_bytes = cf620_pdf.read()
-                st.session_state.pdf_bytes_cache = pdf_bytes
-                st.session_state.cf620_pdf_name = cf620_pdf.name
-
-                with st.spinner("📖 使用 Gemini Vision 辨識目錄中，請稍候…"):
-                    if not api_key:
-                        st.error("⚠️ 請先輸入 API Key 才能辨識目錄！")
-                        toc, toc_raw, detected_offset, total_pages = [], [], 0, 1
-                    else:
-                        toc, toc_raw, detected_offset, total_pages = build_toc_via_vision(
-                            api_key, selected_model, pdf_bytes)
-                    st.session_state.cf620_total_pages  = total_pages
-                    st.session_state.cf620_toc          = toc
-                    st.session_state.cf620_toc_raw      = toc_raw
-                    st.session_state.cf620_detected_offset = detected_offset
-            else:
-                # 同一份 PDF，直接從快取載入
-                pdf_bytes       = st.session_state.pdf_bytes_cache
-                toc             = st.session_state.cf620_toc
-                toc_raw         = st.session_state.cf620_toc_raw
-                detected_offset = st.session_state.cf620_detected_offset
-                total_pages     = st.session_state.cf620_total_pages
-
-            st.info(f"📖 已載入：共 **{total_pages}** 頁　｜　偵測到 **{len(toc)}** 個章節")
-
-            # ── 頁碼校正：預設摺疊，進階用戶才需要展開 ────────
-            if toc_raw:
-                with st.expander("⚙️ 頁碼有偏差？展開校正（選用）", expanded=False):
-                    st.caption("選一個你確定的章節，輸入它在 PDF 中實際的頁碼，程式會自動修正所有章節頁碼")
-                    ref_options = [
-                        f"第 {item[2]} 頁 | {item[1]}"
-                        for item in toc
-                    ]
-                    col_ref1, col_ref2 = st.columns([2, 1])
-                    with col_ref1:
-                        selected_ref = st.selectbox(
-                            "選擇參考章節",
-                            ["— 不校正 —"] + ref_options,
-                            key="ref_select",
-                        )
-                    with col_ref2:
-                        if selected_ref != "— 不校正 —":
-                            actual_page = st.number_input(
-                                "實際頁碼",
-                                min_value=1, max_value=total_pages,
-                                value=int(selected_ref.split()[1]),
-                                key="actual_page",
-                            )
+            if cf620_pdf:
+                if cf620_pdf.name != st.session_state.cf620_pdf_name:
+                    pdf_bytes = cf620_pdf.read()
+                    st.session_state.pdf_bytes_cache = pdf_bytes
+                    st.session_state.cf620_pdf_name = cf620_pdf.name
+                    with st.spinner("📖 使用 Gemini Vision 辨識目錄並建立頁碼對照表，請稍候…"):
+                        if not api_key:
+                            st.error("⚠️ 請先在左側輸入 API Key 才能辨識目錄！")
+                            toc, toc_raw, detected_offset, total_pages = [], [], 0, 1
+                            page_map, coverage, needs_review, anomalies = {}, 0.0, False, []
                         else:
-                            actual_page = None
-
-                    # 根據參考點重算偏移
-                    if selected_ref != "— 不校正 —" and actual_page is not None:
-                        ref_idx = ref_options.index(selected_ref)
-                        correct_offset = actual_page - toc_raw[ref_idx][2]
-                        st.success(f"✅ 校正完成！偏移 {correct_offset:+d} 頁")
-                        toc = [
-                            [lv, t, max(1, lp + correct_offset)]
-                            for lv, t, lp in toc_raw
-                        ]
-
-            if toc:
-                toc_options = [
-                    f"第{item[2]}頁｜{'　' * (item[0]-1)}{item[1]}"
-                    for item in toc
-                ]
-
-                # ── 預設：單一章節選擇（selectbox 內建搜尋）────
-                selected_toc = st.selectbox(
-                    f"選擇章節（共 {len(toc)} 筆，可直接輸入關鍵字搜尋）",
-                    ["— 請選擇 —"] + toc_options,
-                    key="toc_select",
-                )
-
-                # ── 跨章節模式：checkbox 預設隱藏 ─────────
-                multi_mode = st.checkbox("需要跨多個章節？", key="multi_mode")
-
-                if not multi_mode:
-                    # ══ 單一章節 ══════════════════════════
-                    if selected_toc != "— 請選擇 —":
-                        chosen_idx = toc_options.index(selected_toc)
-                        auto_start = toc[chosen_idx][2]
-                        auto_end   = total_pages
-                        _next_id   = ""
-                        for j in range(chosen_idx + 1, len(toc)):
-                            if toc[j][0] <= toc[chosen_idx][0]:
-                                auto_end = toc[j][2] - 1
-                                _next_id = toc[j][1].split()[0]
-                                break
-                        auto_end = max(auto_end, auto_start)
-                        auto_end = min(auto_end, auto_start + 29)  # 最多 30 頁
-                        st.session_state.chapter_id      = toc[chosen_idx][1].split()[0]
-                        st.session_state.next_chapter_id = _next_id
-                    else:
-                        auto_start, auto_end = 1, min(10, total_pages)
-                        st.session_state.chapter_id = ""
-                        st.session_state.next_chapter_id = ""
-
+                            (toc, toc_raw, detected_offset, total_pages,
+                             page_map, coverage, needs_review, anomalies) = build_toc_via_vision(
+                                api_key, selected_model, pdf_bytes)
+                        st.session_state.cf620_total_pages     = total_pages
+                        st.session_state.cf620_toc             = toc
+                        st.session_state.cf620_toc_raw         = toc_raw
+                        st.session_state.cf620_detected_offset = detected_offset
+                        st.session_state.cf620_page_map        = page_map
+                        st.session_state.cf620_coverage        = coverage
+                        st.session_state.cf620_needs_review    = needs_review
+                        st.session_state.cf620_anomalies       = anomalies
                 else:
-                    # ══ 跨章節範圍 ════════════════════════
-                    col_s, col_e = st.columns(2)
-                    with col_s:
-                        start_sel = st.selectbox(
-                            f"起始章節（共 {len(toc)} 筆）",
-                            ["— 請選擇 —"] + toc_options,
-                            key="range_start",
-                        )
-                    with col_e:
-                        end_sel = st.selectbox(
-                            "結束章節",
-                            ["— 請選擇 —"] + toc_options,
-                            key="range_end",
-                        )
+                    pdf_bytes       = st.session_state.pdf_bytes_cache
+                    toc             = st.session_state.cf620_toc
+                    toc_raw         = st.session_state.cf620_toc_raw
+                    detected_offset = st.session_state.cf620_detected_offset
+                    total_pages     = st.session_state.cf620_total_pages
+                    page_map        = st.session_state.get("cf620_page_map", {})
+                    coverage        = st.session_state.get("cf620_coverage", 0.0)
+                    needs_review    = st.session_state.get("cf620_needs_review", False)
+                    anomalies       = st.session_state.get("cf620_anomalies", [])
 
+                # ── 載入摘要 + 頁碼信心度 ──
+                c1, c2, c3 = st.columns(3)
+                c1.metric("總頁數", total_pages)
+                c2.metric("偵測章節", len(toc))
+                if page_map:
+                    c3.metric("頁碼比對命中", f"{coverage:.0%}")
+                else:
+                    c3.metric("頁碼比對命中", "—")
+
+                # ══ 方案 C：異常自動提示，命中良好則顯示綠燈 ══
+                if needs_review:
+                    st.warning(
+                        "⚠️ 偵測到頁碼可能有偏差，請展開下方校正面板確認：\n\n- "
+                        + "\n- ".join(anomalies[:5])
+                    )
+                elif page_map and coverage >= 0.8:
+                    st.success(f"✅ 頁碼已自動對照完成（命中率 {coverage:.0%}），通常無需手動校正")
+                elif not page_map:
+                    st.info("ℹ️ 此 PDF 頁眉/頁尾未偵測到可辨識的印刷頁碼，已採用估算偏移，如有偏差請於下方校正")
+
+                # ── 頁碼校正面板：異常時自動展開（方案 C 安全網） ──
+                if toc_raw:
+                    with st.expander("⚙️ 頁碼校正（選用）", expanded=needs_review):
+                        st.caption("選一個你確定的章節，輸入它在 PDF 中實際的頁碼，程式會自動修正所有章節頁碼")
+                        ref_options = [f"第 {item[2]} 頁 | {item[1]}" for item in toc]
+                        cr1, cr2 = st.columns([2, 1])
+                        with cr1:
+                            selected_ref = st.selectbox(
+                                "選擇參考章節", ["— 不校正 —"] + ref_options, key="ref_select")
+                        with cr2:
+                            if selected_ref != "— 不校正 —":
+                                actual_page = st.number_input(
+                                    "實際頁碼", min_value=1, max_value=max(1, total_pages),
+                                    value=int(selected_ref.split()[1]), key="actual_page")
+                            else:
+                                actual_page = None
+                        if selected_ref != "— 不校正 —" and actual_page is not None:
+                            ref_idx = ref_options.index(selected_ref)
+                            correct_offset = actual_page - toc_raw[ref_idx][2]
+                            st.success(f"✅ 校正完成！整體偏移 {correct_offset:+d} 頁")
+                            toc = [[lv, t, max(1, lp + correct_offset)] for lv, t, lp in toc_raw]
+
+                # ── 章節選擇 ──
+                if toc:
+                    toc_options = [f"第{item[2]}頁｜{'　' * (item[0]-1)}{item[1]}" for item in toc]
+                    selected_toc = st.selectbox(
+                        f"選擇章節（共 {len(toc)} 筆，可輸入關鍵字搜尋）",
+                        ["— 請選擇 —"] + toc_options, key="toc_select")
+                    multi_mode = st.checkbox("需要跨多個章節？", key="multi_mode")
+
+                    if not multi_mode:
+                        if selected_toc != "— 請選擇 —":
+                            chosen_idx = toc_options.index(selected_toc)
+                            auto_start = toc[chosen_idx][2]
+                            auto_end   = total_pages
+                            _next_id   = ""
+                            for j in range(chosen_idx + 1, len(toc)):
+                                if toc[j][0] <= toc[chosen_idx][0]:
+                                    auto_end = toc[j][2] - 1
+                                    _next_id = toc[j][1].split()[0]
+                                    break
+                            auto_end = max(auto_end, auto_start)
+                            auto_end = min(auto_end, auto_start + 29)
+                            st.session_state.chapter_id      = toc[chosen_idx][1].split()[0]
+                            st.session_state.next_chapter_id = _next_id
+                        else:
+                            auto_start, auto_end = 1, min(10, total_pages)
+                            st.session_state.chapter_id = ""
+                            st.session_state.next_chapter_id = ""
+                    else:
+                        cs, ce = st.columns(2)
+                        with cs:
+                            start_sel = st.selectbox(
+                                f"起始章節（共 {len(toc)} 筆）",
+                                ["— 請選擇 —"] + toc_options, key="range_start")
+                        with ce:
+                            end_sel = st.selectbox(
+                                "結束章節", ["— 請選擇 —"] + toc_options, key="range_end")
                         if start_sel != "— 請選擇 —" and end_sel != "— 請選擇 —":
                             si = toc_options.index(start_sel)
                             ei = toc_options.index(end_sel)
-
                             if ei < si:
                                 st.error("❌ 結束章節不能在起始章節之前，請重新選擇。")
                                 auto_start, auto_end = 1, min(10, total_pages)
@@ -623,8 +743,8 @@ with st.container():
                                 st.session_state.next_chapter_id = ""
                             else:
                                 auto_start = toc[si][2]
-                                auto_end  = total_pages
-                                _next_id  = ""
+                                auto_end   = total_pages
+                                _next_id   = ""
                                 for j in range(ei + 1, len(toc)):
                                     if toc[j][0] <= toc[ei][0]:
                                         auto_end = toc[j][2] - 1
@@ -635,108 +755,118 @@ with st.container():
                                 if page_span > 30:
                                     st.info(
                                         f"ℹ️ 已選 **{toc[si][1]}** → **{toc[ei][1]}**，"
-                                        f"共約 **{page_span}** 頁。頁數較多時 AI 改寫可能需要較長時間。"
-                                    )
+                                        f"共約 **{page_span}** 頁。頁數較多時改寫時間較長。")
                                 st.session_state.chapter_id      = toc[si][1].split()[0]
                                 st.session_state.next_chapter_id = _next_id
                         else:
                             auto_start, auto_end = 1, min(10, total_pages)
                             st.session_state.chapter_id = ""
                             st.session_state.next_chapter_id = ""
-
-            else:
-                st.warning("⚠️ 未偵測到章節標題，請手動輸入頁碼。")
-                auto_start, auto_end = 1, min(10, total_pages)
-
-            # ── 頁碼範圍：自動計算結果直接顯示，進階用戶可展開微調 ──
-            page_count_preview = min(auto_end, total_pages) - auto_start + 1
-            if page_count_preview > 30:
-                st.warning(f"⚠️ 預計萃取 {page_count_preview} 頁，建議不超過 30 頁。")
-            else:
-                st.success(f"✅ 即將萃取第 {auto_start} ～ {min(auto_end, total_pages)} 頁（共 {page_count_preview} 頁）")
-
-            # 預設值（expander 未展開時使用）
-            page_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
-            page_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
-
-            with st.expander("🔧 手動調整頁碼範圍（選用）", expanded=False):
-                st.caption("若自動計算的頁碼範圍不正確，可在此手動修改")
-                c_s, c_e = st.columns(2)
-                _safe_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
-                _safe_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
-                with c_s:
-                    page_start = st.number_input("起始頁", 1, max(1, total_pages), _safe_start)
-                with c_e:
-                    page_end = st.number_input("結束頁", 1, max(1, total_pages), _safe_end)
-                page_count = page_end - page_start + 1
-                if page_count > 30:
-                    st.warning(f"⚠️ 選取 {page_count} 頁，建議不超過 30 頁。")
-
-            if st.button("📥 萃取選定頁面內容", use_container_width=True):
-                with st.spinner(f"萃取第 {page_start}～{page_end} 頁..."):
-                    try:
-                        extracted, _ = extract_pages(pdf_bytes, page_start, page_end)
-                        # ── 精確裁切：去除前後相鄰章節的殘留內容 ──
-                        ch_id   = st.session_state.get("chapter_id", "")
-                        next_id = st.session_state.get("next_chapter_id", "")
-                        if ch_id:
-                            extracted = trim_to_chapter(extracted, ch_id, next_id or None)
-                        st.session_state.extracted_old_text = extracted
-                        st.success(f"✅ 萃取完成！共 {len(extracted)} 字元")
-                        with st.expander("預覽萃取內容", expanded=False):
-                            st.text(extracted[:3000] + ("..." if len(extracted) > 3000 else ""))
-                    except Exception as e:
-                        st.error(f"❌ 萃取失敗：{e}")
-
-    # ── Tab 2：手動貼上 ──────────────────────────────────
-    with tab_paste:
-        pasted_text = st.text_area(
-            "請複製舊規範條文貼在此處：",
-            height=380,
-            placeholder="貼上純文字條文，若有表格無法複製請改用其他分頁..."
-        )
-
-    # ── Tab 3：截圖辨識 ──────────────────────────────────
-    with tab_img:
-        st.caption("📷 截圖後上傳，由 Gemini 辨識圖片中的表格")
-        cf620_img = st.file_uploader("上傳截圖（PNG / JPG）",
-            type=["png", "jpg", "jpeg"], key="cf620_img")
-        if cf620_img:
-            st.image(cf620_img, use_container_width=True)
-            if st.button("🔍 執行圖片辨識", use_container_width=True):
-                if not api_key:
-                    st.error("⚠️ 請先輸入 API Key！")
                 else:
-                    with st.spinner("Gemini 辨識中..."):
+                    st.warning("⚠️ 未偵測到章節標題，請手動輸入頁碼。")
+                    auto_start, auto_end = 1, min(10, total_pages)
+
+                # ── 頁碼範圍提示 + 手動微調 ──
+                page_count_preview = min(auto_end, total_pages) - auto_start + 1
+                if page_count_preview > 30:
+                    st.warning(f"⚠️ 預計萃取 {page_count_preview} 頁，建議不超過 30 頁。")
+                else:
+                    st.success(f"✅ 即將萃取第 {auto_start} ～ {min(auto_end, total_pages)} 頁（共 {page_count_preview} 頁）")
+
+                page_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
+                page_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
+
+                with st.expander("🔧 手動調整頁碼範圍（選用）", expanded=False):
+                    cs2, ce2 = st.columns(2)
+                    _safe_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
+                    _safe_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
+                    with cs2:
+                        page_start = st.number_input("起始頁", 1, max(1, total_pages), _safe_start)
+                    with ce2:
+                        page_end = st.number_input("結束頁", 1, max(1, total_pages), _safe_end)
+                    if page_end - page_start + 1 > 30:
+                        st.warning(f"⚠️ 選取 {page_end - page_start + 1} 頁，建議不超過 30 頁。")
+
+                if st.button("📥 萃取選定頁面內容", use_container_width=True, type="primary"):
+                    with st.spinner(f"萃取第 {page_start}～{page_end} 頁..."):
                         try:
-                            mime = "image/png" if cf620_img.name.lower().endswith(".png") else "image/jpeg"
-                            result = extract_text_from_image(api_key, selected_model, cf620_img.read(), mime)
-                            st.session_state.extracted_old_text = result
-                            st.success("✅ 辨識完成！")
-                            with st.expander("預覽辨識結果", expanded=True):
-                                st.markdown(result)
+                            extracted, _ = extract_pages(pdf_bytes, page_start, page_end)
+                            ch_id   = st.session_state.get("chapter_id", "")
+                            next_id = st.session_state.get("next_chapter_id", "")
+                            if ch_id:
+                                extracted = trim_to_chapter(extracted, ch_id, next_id or None)
+                            st.session_state.extracted_old_text = extracted
+                            st.success(f"✅ 萃取完成！共 {len(extracted)} 字元，可前往「② 改寫結果」執行改寫")
+                            with st.expander("預覽萃取內容", expanded=False):
+                                st.text(extracted[:3000] + ("..." if len(extracted) > 3000 else ""))
                         except Exception as e:
-                            st.error(f"❌ 辨識失敗：{e}")
+                            st.error(f"❌ 萃取失敗：{e}")
+
+        # ── 來源 2：手動貼上 ──
+        with src_paste:
+            pasted_text = st.text_area(
+                "請複製舊規範條文貼在此處：", height=360,
+                placeholder="貼上純文字條文，若有表格無法複製請改用 PDF 或截圖分頁...")
+
+        # ── 來源 3：截圖辨識 ──
+        with src_img:
+            st.markdown(
+                '<div class="pts-hint">📷 截圖後上傳，由 Gemini 辨識圖片中的文字與表格</div>',
+                unsafe_allow_html=True)
+            cf620_img = st.file_uploader("上傳截圖（PNG / JPG）",
+                type=["png", "jpg", "jpeg"], key="cf620_img")
+            if cf620_img:
+                st.image(cf620_img, use_container_width=True)
+                if st.button("🔍 執行圖片辨識", use_container_width=True):
+                    if not api_key:
+                        st.error("⚠️ 請先輸入 API Key！")
+                    else:
+                        with st.spinner("Gemini 辨識中..."):
+                            try:
+                                mime = "image/png" if cf620_img.name.lower().endswith(".png") else "image/jpeg"
+                                result = extract_text_from_image(api_key, selected_model, cf620_img.read(), mime)
+                                st.session_state.extracted_old_text = result
+                                st.success("✅ 辨識完成！可前往「② 改寫結果」執行改寫")
+                                with st.expander("預覽辨識結果", expanded=True):
+                                    st.markdown(result)
+                            except Exception as e:
+                                st.error(f"❌ 辨識失敗：{e}")
+
+    # ── 右窄欄：改寫方向提示語（從 sidebar 搬來，避免 sidebar 太擠） ──
+    with in_side:
+        st.subheader("✏️ 改寫方向提示語")
+        st.caption("可填改寫方向、特殊要求或精進文字（選填），AI 改寫時一併參考")
+        user_hint = st.text_area(
+            "提示語", height=260,
+            placeholder="例如：\n・電力系統改用 750V DC\n・保留所有測試步驟數值\n・或貼上精進文件全文（約 1000 字內最佳）…",
+            label_visibility="collapsed", key="user_hint_area")
+
+        # 來源整合狀態
+        st.markdown("##### 📌 目前輸入狀態")
+        if st.session_state.extracted_old_text:
+            st.success(f"已就緒：PDF / 圖片萃取結果（{len(st.session_state.extracted_old_text)} 字元）")
+        else:
+            st.info("尚未萃取內容；若用「直接貼上」則於貼上後即可改寫")
 
     # 整合輸入來源
     if st.session_state.extracted_old_text:
         old_text = st.session_state.extracted_old_text
-        st.info("✅ 目前使用：PDF 頁面萃取 / 圖片辨識結果")
     else:
         old_text = pasted_text if "pasted_text" in dir() else ""
 
     st.markdown("---")
-    run_btn = st.button("🚀 執行 AI 改寫",
-        disabled=st.session_state.running,
-        use_container_width=True, type="primary")
-    clear_btn = st.button("✏️ 清除結果", use_container_width=True)
+    bc1, bc2 = st.columns([3, 1])
+    with bc1:
+        run_btn = st.button("🚀 執行 AI 改寫（結果顯示於「② 改寫結果」）",
+            disabled=st.session_state.running, use_container_width=True, type="primary")
+    with bc2:
+        clear_btn = st.button("🗑️ 清除結果", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════
-# 結果區（緊接在輸入區下方）
+# ② 改寫結果分頁
 # ══════════════════════════════════════════════════════════
-st.markdown("---")
-with st.container():
-    st.subheader("✨ ② 智慧改寫草稿")
+with tab_result:
+    st.subheader("✨ 智慧改寫草稿")
 
     if clear_btn:
         st.session_state.result_text = ""
@@ -747,12 +877,12 @@ with st.container():
 
     if run_btn:
         if not api_key:
-            st.error("⚠️ 請先輸入 Gemini API Key！")
+            st.error("⚠️ 請先在左側輸入 Gemini API Key！")
         elif not old_text or not old_text.strip():
             if st.session_state.pdf_bytes_cache:
-                st.error("⚠️ 請先點擊「📥 萃取選定頁面內容」按鈕，再執行 AI 改寫！")
+                st.error("⚠️ 請先到「① 輸入」分頁點擊「📥 萃取選定頁面內容」，再執行改寫！")
             else:
-                st.error("⚠️ 請先提供待改寫條文（上傳 PDF 並萃取、貼上文字，或上傳截圖辨識）。")
+                st.error("⚠️ 請先於「① 輸入」分頁提供待改寫條文。")
         else:
             st.session_state.running = True
             hint_section = (
@@ -809,7 +939,6 @@ with st.container():
 === 五、專業意見與注意事項 ===
 （每項以「💡」開頭，各項間空一行）
 """
-            # ── 串流改寫 ──────────────────────────────────────
             stream_box = st.empty()
             retries, success, full_text = 3, False, ""
             while not success and retries > 0:
@@ -826,7 +955,6 @@ with st.container():
                             pass
                     stream_box.empty()
                     st.session_state.result_text = full_text
-                    # ── 寫入歷史 ──────────────────────────────
                     chapter_label = st.session_state.get("chapter_id") or "手動輸入"
                     st.session_state.rewrite_history.insert(0, {
                         "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
@@ -850,64 +978,45 @@ with st.container():
                         st.error(f"❌ 錯誤：{err}"); break
             if not success and retries == 0:
                 st.error("❌ 已超過重試次數，請稍後手動重試。")
-
             st.session_state.running = False
             st.rerun()
 
     if st.session_state.result_text:
-
-        # ── 歷史記錄選擇器 ────────────────────────────────────
+        # ── 版本 + 模式 控制列（分欄擺放，視覺更整齊） ──
+        ctrl1, ctrl2 = st.columns([3, 2])
         history = st.session_state.rewrite_history
-        if len(history) > 1:
-            history_labels = [
-                f"第{i+1}版　{h['ts']}　{h['label']}"
-                for i, h in enumerate(history)
-            ]
-            sel_label = st.selectbox(
-                "📋 歷史版本",
-                history_labels,
-                index=0,
-                key="history_select",
-            )
-            sel_idx = history_labels.index(sel_label)
-            display_result  = history[sel_idx]["text"]
-            display_old     = history[sel_idx]["old_text"]
-        else:
-            display_result  = st.session_state.result_text
-            display_old     = st.session_state.get("current_old_text_snapshot", "")
-
-        # ── 新舊對照 / 一般模式切換 ──────────────────────────
-        compare_mode = st.toggle("📊 新舊對照模式（原文 ↔ 改寫）", key="compare_toggle")
+        with ctrl1:
+            if len(history) > 1:
+                history_labels = [f"第{i+1}版　{h['ts']}　{h['label']}" for i, h in enumerate(history)]
+                sel_label = st.selectbox("📋 歷史版本", history_labels, index=0, key="history_select")
+                sel_idx = history_labels.index(sel_label)
+                display_result = history[sel_idx]["text"]
+                display_old    = history[sel_idx]["old_text"]
+            else:
+                display_result = st.session_state.result_text
+                display_old    = st.session_state.get("current_old_text_snapshot", "")
+        with ctrl2:
+            st.write("")
+            compare_mode = st.toggle("📊 新舊對照模式", key="compare_toggle")
 
         if compare_mode:
-            # 取出 section 一 的改寫後條文
             _secs = display_result.split("===")
             _parsed_for_compare = {}
             for _i in range(1, len(_secs) - 1, 2):
                 _parsed_for_compare[_secs[_i].strip()] = (
-                    _secs[_i + 1].strip() if _i + 1 < len(_secs) else ""
-                )
+                    _secs[_i + 1].strip() if _i + 1 < len(_secs) else "")
             section_one_text = next(
-                (c for t, c in _parsed_for_compare.items() if t.startswith("一")),
-                display_result,
-            )
+                (c for t, c in _parsed_for_compare.items() if t.startswith("一")), display_result)
             left_col, right_col = st.columns(2)
             with left_col:
                 st.caption("📄 原始條文")
-                st.text_area(
-                    "原始", value=display_old or "（無原始條文快照）",
-                    height=600, disabled=True, label_visibility="collapsed",
-                    key="orig_view",
-                )
+                st.text_area("原始", value=display_old or "（無原始條文快照）",
+                    height=600, disabled=True, label_visibility="collapsed", key="orig_view")
             with right_col:
                 st.caption("✨ 改寫後條文（一、）")
-                st.text_area(
-                    "改寫", value=section_one_text,
-                    height=600, disabled=True, label_visibility="collapsed",
-                    key="rewrite_view",
-                )
+                st.text_area("改寫", value=section_one_text,
+                    height=600, disabled=True, label_visibility="collapsed", key="rewrite_view")
         else:
-            # ── 一般結構化顯示 ────────────────────────────────
             result_text = display_result
             sections = result_text.split("===")
             parsed = {}
@@ -915,154 +1024,158 @@ with st.container():
                 title = sections[i].strip()
                 content = sections[i + 1].strip() if i + 1 < len(sections) else ""
                 parsed[title] = content
-
             emoji_map = {"一": "📄", "二": "⚠️", "三": "🆕", "四": "🗑️", "五": "💡"}
+
+            def parse_md_table_to_html(md_lines):
+                html = ['<table border="1" style="border-collapse:collapse;width:100%;font-size:0.9em;">']
+                is_header = True
+                for row in md_lines:
+                    if re.match(r"^\|[-:\s|]+\|$", row.strip()):
+                        is_header = False
+                        continue
+                    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                    tag = "th" if is_header else "td"
+                    style = "padding:6px 10px;vertical-align:top;border:1px solid #ccc;"
+                    if is_header:
+                        style += "background:#f0f0f0;font-weight:bold;"
+                    row_html = "<tr>" + "".join(
+                        f'<{tag} style="{style}">{format_cell(c)}</{tag}>' for c in cells) + "</tr>"
+                    html.append(row_html)
+                html.append("</table>")
+                return "\n".join(html)
+
+            def format_cell(text):
+                import html as html_mod
+                if text is None:
+                    return ""
+                text = str(text)
+                text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+                text = re.sub(r"\s*；\s*", "；", text)
+                item_pat = re.compile(r"(?<![\d.])(\d{1,2})[.、]\s*(?!\d)")
+                matches = list(item_pat.finditer(text))
+                if matches:
+                    preamble = text[:matches[0].start()].strip("；; \n\t")
+                    items = []
+                    for idx, match in enumerate(matches):
+                        item_start = match.end()
+                        item_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                        item_text = text[item_start:item_end].strip("；; \n\t")
+                        if item_text:
+                            items.append(item_text)
+                    if items:
+                        first_number = matches[0].group(1)
+                        prefix = (f"<p style='margin:0 0 4px 0;'>{html_mod.escape(preamble)}</p>"
+                                  if preamble else "")
+                        li_items = "".join(
+                            f"<li>{html_mod.escape(item).replace(chr(10), '<br>')}</li>" for item in items)
+                        return (f"{prefix}<ol start='{first_number}' style='margin:0;padding-left:1.4em;'>"
+                                f"{li_items}</ol>")
+                return html_mod.escape(text).replace("\n", "<br>")
+
+            def render_section(title, content):
+                lines = content.split("\n")
+                output_parts = []
+                i = 0
+                while i < len(lines):
+                    stripped = lines[i].strip()
+                    if stripped.startswith("|"):
+                        tbl_rows = []
+                        while i < len(lines) and (lines[i].strip().startswith("|") or
+                              (not lines[i].strip() and i+1 < len(lines) and lines[i+1].strip().startswith("|"))):
+                            if lines[i].strip():
+                                tbl_rows.append(lines[i].strip())
+                            i += 1
+                        output_parts.append(("table", tbl_rows))
+                    else:
+                        md_lines = []
+                        while i < len(lines) and not lines[i].strip().startswith("|"):
+                            md_lines.append(lines[i])
+                            i += 1
+                        output_parts.append(("md", md_lines))
+                final_html_parts = []
+                for part_type, part_data in output_parts:
+                    if part_type == "table":
+                        final_html_parts.append(parse_md_table_to_html(part_data))
+                    else:
+                        md_text = ""
+                        for ln in part_data:
+                            s = ln.strip()
+                            md_text += ln + "\n"
+                            if s and not s.startswith("---") and not s.startswith("|"):
+                                md_text += "\n"
+                        if md_text.strip():
+                            final_html_parts.append(f"MARKDOWN_BLOCK:{md_text}")
+                for part in final_html_parts:
+                    if part.startswith("MARKDOWN_BLOCK:"):
+                        st.markdown(part[len("MARKDOWN_BLOCK:"):])
+                    else:
+                        st.markdown(part, unsafe_allow_html=True)
+
             if parsed:
-                for title, content in parsed.items():
-                    emoji = emoji_map.get(title[0] if title else "", "📌")
-                    with st.expander(f"{emoji} {title}", expanded=title.startswith("一")):
+                # ── 結果分欄：主條文（一）佔大欄，其餘摘要收進右側 ──
+                main_title = next((t for t in parsed if t.startswith("一")), None)
+                other_titles = [t for t in parsed if t != main_title]
 
-                        def parse_md_table_to_html(md_lines):
-                            html = ['<table border="1" style="border-collapse:collapse;width:100%;font-size:0.9em;">']
-                            is_header = True
-                            for row in md_lines:
-                                if re.match(r"^\|[-:\s|]+\|$", row.strip()):
-                                    is_header = False
-                                    continue
-                                cells = [c.strip() for c in row.strip().strip("|").split("|")]
-                                tag = "th" if is_header else "td"
-                                style = "padding:6px 10px;vertical-align:top;border:1px solid #ccc;"
-                                if is_header:
-                                    style += "background:#f0f0f0;font-weight:bold;"
-                                row_html = "<tr>" + "".join(
-                                    f'<{tag} style="{style}">{format_cell(c)}</{tag}>'
-                                    for c in cells
-                                ) + "</tr>"
-                                html.append(row_html)
-                            html.append("</table>")
-                            return "\n".join(html)
-
-                        def format_cell(text):
-                            import html as html_mod
-                            if text is None:
-                                return ""
-                            text = str(text)
-                            text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                            text = text.replace("\r\n", "\n").replace("\r", "\n")
-                            text = re.sub(r"\s*；\s*", "；", text)
-                            item_pat = re.compile(r"(?<![\d.])(\d{1,2})[.、]\s*(?!\d)")
-                            matches = list(item_pat.finditer(text))
-                            if matches:
-                                preamble = text[:matches[0].start()].strip("；; \n\t")
-                                items = []
-                                for idx, match in enumerate(matches):
-                                    item_start = match.end()
-                                    item_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-                                    item_text = text[item_start:item_end].strip("；; \n\t")
-                                    if item_text:
-                                        items.append(item_text)
-                                if items:
-                                    first_number = matches[0].group(1)
-                                    prefix = (
-                                        f"<p style='margin:0 0 4px 0;'>{html_mod.escape(preamble)}</p>"
-                                        if preamble else ""
-                                    )
-                                    li_items = "".join(
-                                        f"<li>{html_mod.escape(item).replace(chr(10), '<br>')}</li>"
-                                        for item in items
-                                    )
-                                    return (
-                                        f"{prefix}"
-                                        f"<ol start='{first_number}' style='margin:0;padding-left:1.4em;'>"
-                                        f"{li_items}"
-                                        f"</ol>"
-                                    )
-                            return html_mod.escape(text).replace("\n", "<br>")
-
-                        lines = content.split("\n")
-                        output_parts = []
-                        i = 0
-                        while i < len(lines):
-                            stripped = lines[i].strip()
-                            if stripped.startswith("|"):
-                                tbl_rows = []
-                                while i < len(lines) and (lines[i].strip().startswith("|") or
-                                      (not lines[i].strip() and i+1 < len(lines) and lines[i+1].strip().startswith("|"))):
-                                    if lines[i].strip():
-                                        tbl_rows.append(lines[i].strip())
-                                    i += 1
-                                output_parts.append(("table", tbl_rows))
-                            else:
-                                md_lines = []
-                                while i < len(lines) and not lines[i].strip().startswith("|"):
-                                    md_lines.append(lines[i])
-                                    i += 1
-                                output_parts.append(("md", md_lines))
-
-                        final_html_parts = []
-                        for part_type, part_data in output_parts:
-                            if part_type == "table":
-                                final_html_parts.append(parse_md_table_to_html(part_data))
-                            else:
-                                md_text = ""
-                                for ln in part_data:
-                                    s = ln.strip()
-                                    md_text += ln + "\n"
-                                    if s and not s.startswith("---") and not s.startswith("|"):
-                                        md_text += "\n"
-                                if md_text.strip():
-                                    final_html_parts.append(f"MARKDOWN_BLOCK:{md_text}")
-
-                        for part in final_html_parts:
-                            if part.startswith("MARKDOWN_BLOCK:"):
-                                st.markdown(part[len("MARKDOWN_BLOCK:"):])
-                            else:
-                                st.markdown(part, unsafe_allow_html=True)
+                res_main, res_side = st.columns([3, 2], gap="large")
+                with res_main:
+                    if main_title:
+                        st.markdown(f"#### {emoji_map.get('一','📄')} {main_title}")
+                        render_section(main_title, parsed[main_title])
+                with res_side:
+                    st.markdown("#### 📑 摘要與待確認")
+                    for title in other_titles:
+                        emoji = emoji_map.get(title[0] if title else "", "📌")
+                        with st.expander(f"{emoji} {title}", expanded=title.startswith("二")):
+                            render_section(title, parsed[title])
             else:
                 st.markdown(result_text)
 
         st.success("✅ 改寫完成！")
-        dl_col1, dl_col2 = st.columns(2)
-        with dl_col1:
-            st.download_button(
-                "⬇️ 下載 Word 檔（.docx）",
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button("⬇️ 下載 Word 檔（.docx）",
                 data=result_to_docx(display_result),
                 file_name="未來線中運量_改寫結果.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
-        with dl_col2:
-            st.download_button(
-                "⬇️ 下載純文字（.txt）",
+                use_container_width=True)
+        with dl2:
+            st.download_button("⬇️ 下載純文字（.txt）",
                 data=display_result.encode("utf-8"),
                 file_name="未來線中運量_改寫結果.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+                mime="text/plain", use_container_width=True)
+    else:
+        st.info("尚未產出結果。請至「① 輸入」分頁提供條文並執行改寫。")
 
-        # ── 後續修改指令 ──────────────────────────────────────
-        st.markdown("---")
-        st.subheader("🔄 後續修改指令")
-        st.caption("針對上方改寫結果，輸入補充指令後，AI 將依指令進行二次精修")
-        post_hint = st.text_area(
-            "輸入修改指令",
-            height=120,
+# ══════════════════════════════════════════════════════════
+# ③ 二次精修分頁
+# ══════════════════════════════════════════════════════════
+with tab_refine:
+    st.subheader("🔄 二次精修")
+    if not st.session_state.result_text:
+        st.info("尚無可精修的草稿，請先於「② 改寫結果」完成一次改寫。")
+    else:
+        st.caption("針對目前改寫結果輸入補充指令，AI 將依指令進行二次精修（結果同步更新至「② 改寫結果」）")
+        result_text = st.session_state.result_text
+        with st.expander("📄 目前草稿預覽（一、改寫後條文）", expanded=False):
+            _secs = result_text.split("===")
+            _p = {}
+            for _i in range(1, len(_secs) - 1, 2):
+                _p[_secs[_i].strip()] = _secs[_i + 1].strip() if _i + 1 < len(_secs) else ""
+            _one = next((c for t, c in _p.items() if t.startswith("一")), result_text)
+            st.text(_one[:2000] + ("..." if len(_one) > 2000 else ""))
+
+        post_hint = st.text_area("輸入修改指令", height=140,
             placeholder="例如：\n・請將第 3.1.2 條的電壓改為 750V DC\n・把第 3.2 條表格的測試時間全部改為 30 分鐘\n・幫我刪除第 3.3 條整條",
-            label_visibility="collapsed",
-            key="post_hint_area",
-        )
-        post_btn = st.button(
-            "🔄 依指令修改改寫結果",
-            use_container_width=True,
-            type="secondary",
-            disabled=st.session_state.running,
-        )
+            label_visibility="collapsed", key="post_hint_area")
+        post_btn = st.button("🔄 依指令修改改寫結果", use_container_width=True,
+            type="primary", disabled=st.session_state.running)
 
         if post_btn:
             if not post_hint or not post_hint.strip():
                 st.warning("⚠️ 請先輸入修改指令！")
             elif not api_key:
-                st.error("⚠️ 請先在側欄輸入 Gemini API Key！")
+                st.error("⚠️ 請先在左側輸入 Gemini API Key！")
             else:
                 refine_prompt = f"""你是一位具備捷運機電系統工程與合約撰寫背景的資深專家。
 
@@ -1096,7 +1209,6 @@ with st.container():
                                 pass
                         stream_box2.empty()
                         st.session_state.result_text = full_text
-                        # 寫入歷史（精修版）
                         chapter_label = st.session_state.get("chapter_id") or "手動輸入"
                         st.session_state.rewrite_history.insert(0, {
                             "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
@@ -1118,7 +1230,5 @@ with st.container():
                 if not success and retries == 0:
                     st.error("❌ 已超過重試次數，請稍後手動重試。")
                 if success:
-                    st.success("✅ 精修完成！")
+                    st.success("✅ 精修完成！請至「② 改寫結果」查看更新後內容。")
                     st.rerun()
-    else:
-        st.info("尚未產出結果。")
