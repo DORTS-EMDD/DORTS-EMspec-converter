@@ -1040,13 +1040,16 @@ with tab_result:
                     st.session_state.result_text = full_text
                     chapter_label = st.session_state.get("chapter_id") or "手動輸入"
                     _tw_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                    st.session_state.rewrite_history.insert(0, {
+                    _new_entry = {
                         "ts":       _tw_now.strftime("%m/%d %H:%M"),
                         "label":    chapter_label,
                         "text":     full_text,
                         "old_text": old_text,
-                    })
-                    st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                    }
+                    # 重新賦值（非 in-place insert），確保 Streamlit session_state 偵測到變更
+                    st.session_state.rewrite_history = (
+                        [_new_entry] + list(st.session_state.rewrite_history)
+                    )[:10]
                     st.session_state.current_old_text_snapshot = old_text
                     # 清除歷史選單 session state，確保下次顯示最新版
                     st.session_state.pop("history_select", None)
@@ -1323,13 +1326,16 @@ with tab_refine:
                         st.session_state.result_text = full_text
                         chapter_label = st.session_state.get("chapter_id") or "手動輸入"
                         _tw_now2 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                        st.session_state.rewrite_history.insert(0, {
+                        _new_refine_entry = {
                             "ts":       _tw_now2.strftime("%m/%d %H:%M"),
                             "label":    f"{chapter_label}（精修）",
                             "text":     full_text,
                             "old_text": st.session_state.get("current_old_text_snapshot", ""),
-                        })
-                        st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                        }
+                        # 重新賦值（非 in-place insert），確保 Streamlit session_state 偵測到變更
+                        st.session_state.rewrite_history = (
+                            [_new_refine_entry] + list(st.session_state.rewrite_history)
+                        )[:10]
                         # 清除歷史選單 session state，確保顯示最新精修版
                         st.session_state.pop("history_select", None)
                         success = True
