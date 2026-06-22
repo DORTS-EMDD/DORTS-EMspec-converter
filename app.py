@@ -551,7 +551,10 @@ with st.sidebar:
         "🤖 選擇模型",
         ["gemini-3.1-flash-lite", "gemini-3.5-flash"],
         index=0,
-        help="3.1-flash-lite：速度快、省配額，適合一般改寫。\n3.5-flash：細節保留較完整，建議用於重要章節。",
+        help=(
+            "gemini-3.1-flash-lite：Gemini 3 最新輕量版，速度快、省配額，適合大量章節改寫。\n"
+            "gemini-3.5-flash：接近 Pro 等級智能，細節與表格保留更完整，建議用於關鍵章節。"
+        ),
     )
     if api_key:
         st.success("✅ 已輸入 API Key", icon="🔑")
@@ -592,13 +595,25 @@ with st.sidebar:
     if kb_text:
         st.caption(f"📑 目前精進文件約 {len(kb_text):,} 字")
 
+    st.markdown("---")
+    st.header("🔒 術語保護清單（選填）")
+    st.caption("每行一個專業術語，AI 改寫時將原文照錄，不得更動")
+    protected_terms_input = st.text_area(
+        "受保護術語",
+        height=120,
+        placeholder="例如：\n750V DC\nCBTC\nATO自動駕駛\nGoA4",
+        label_visibility="collapsed",
+        key="protected_terms_area",
+    )
+
 # ══════════════════════════════════════════════════════════
 # 主流程：三個分頁（① 輸入 → ② 改寫結果 → ③ 精修）
 # ══════════════════════════════════════════════════════════
-tab_input, tab_result, tab_refine = st.tabs([
+tab_input, tab_result, tab_refine, tab_history = st.tabs([
     "　① 輸入待改寫條文　",
     "　② 改寫結果　",
     "　③ 二次精修　",
+    "　④ 歷史版本　",
 ])
 
 # ══════════════════════════════════════════════════════════
@@ -804,8 +819,21 @@ with tab_input:
 
         # ── 來源 2：手動貼上 ──
         with src_paste:
+            _demo_col, _ = st.columns([1, 3])
+            with _demo_col:
+                if st.button("📋 載入範例條文", help="委員 Demo 時可直接使用，無需輸入原始條文"):
+                    st.session_state.extracted_old_text = (
+                        "3.1.1 電力供應\n本系統採用 1500V DC 第三軌供電方式，"
+                        "變電站間距不超過 2.0 km。\n每節車廂最大用電量為 180 kW。\n\n"
+                        "3.1.2 牽引系統\n牽引馬達採用三相感應馬達，額定功率 150 kW/軸，"
+                        "最高速度 80 km/h，常用減速度 1.0 m/s²，緊急制動減速度 1.3 m/s²。\n\n"
+                        "3.1.3 空調系統\n車廂冷氣量不得低於 12 RT/節，"
+                        "設計溫度：夏季室內 26°C，外氣溫度 35°C。"
+                    )
+                    st.rerun()
             pasted_text = st.text_area(
-                "請複製舊規範條文貼在此處：", height=360,
+                "請複製舊規範條文貼在此處：", height=320,
+                value=st.session_state.get("extracted_old_text", "") if not st.session_state.get("pdf_bytes_cache") else "",
                 placeholder="貼上純文字條文，若有表格無法複製請改用 PDF 或截圖分頁...")
 
         # ── 來源 3：截圖辨識 ──
@@ -817,20 +845,26 @@ with tab_input:
                 type=["png", "jpg", "jpeg"], key="cf620_img")
             if cf620_img:
                 st.image(cf620_img, use_container_width=True)
-                if st.button("🔍 執行圖片辨識", use_container_width=True):
-                    if not api_key:
-                        st.error("⚠️ 請先輸入 API Key！")
-                    else:
-                        with st.spinner("Gemini 辨識中..."):
-                            try:
-                                mime = "image/png" if cf620_img.name.lower().endswith(".png") else "image/jpeg"
-                                result = extract_text_from_image(api_key, selected_model, cf620_img.read(), mime)
-                                st.session_state.extracted_old_text = result
-                                st.success("✅ 辨識完成！可前往「② 改寫結果」執行改寫")
-                                with st.expander("預覽辨識結果", expanded=True):
-                                    st.markdown(result)
-                            except Exception as e:
-                                st.error(f"❌ 辨識失敗：{e}")
+                _ic1, _ic2 = st.columns(2)
+                with _ic1:
+                    if st.button("🔍 執行圖片辨識", use_container_width=True):
+                        if not api_key:
+                            st.error("⚠️ 請先輸入 API Key！")
+                        else:
+                            with st.spinner("Gemini 辨識中..."):
+                                try:
+                                    mime = "image/png" if cf620_img.name.lower().endswith(".png") else "image/jpeg"
+                                    result = extract_text_from_image(api_key, selected_model, cf620_img.read(), mime)
+                                    st.session_state.extracted_old_text = result
+                                    st.success("✅ 辨識完成！可前往「② 改寫結果」執行改寫")
+                                    with st.expander("預覽辨識結果", expanded=True):
+                                        st.markdown(result)
+                                except Exception as e:
+                                    st.error(f"❌ 辨識失敗：{e}")
+                with _ic2:
+                    if st.button("🗑️ 清除辨識結果", use_container_width=True):
+                        st.session_state.extracted_old_text = ""
+                        st.rerun()
 
     # ── 右窄欄：改寫方向提示語（從 sidebar 搬來，避免 sidebar 太擠） ──
     with in_side:
@@ -875,6 +909,22 @@ with tab_result:
         st.session_state.current_old_text_snapshot = ""
         st.rerun()
 
+    if st.session_state.result_text:
+        # ── 修改摘要儀表板 ──────────────────────────────────
+        _rt = st.session_state.result_text
+        _old_snap = st.session_state.get("current_old_text_snapshot", "")
+        _pending_q  = _rt.count("❓")
+        _pending_w  = _rt.count("⚠️")
+        _new_items  = _rt.count("▸")
+        _del_items  = _rt.count("✕")
+        _dash1, _dash2, _dash3, _dash4, _dash5 = st.columns(5)
+        _dash1.metric("📝 原文字元", f"{len(_old_snap):,}" if _old_snap else "—")
+        _dash2.metric("✨ 改寫字元", f"{len(_rt):,}")
+        _dash3.metric("❓ 待確認項目", _pending_q)
+        _dash4.metric("⚠️ 建議評估", _pending_w)
+        _dash5.metric("▸ 新增 / ✕ 調整", f"{_new_items} / {_del_items}")
+        st.markdown("---")
+
     if run_btn:
         if not api_key:
             st.error("⚠️ 請先在左側輸入 Gemini API Key！")
@@ -889,6 +939,15 @@ with tab_result:
                 f"\n\n【使用者額外提示語（請優先遵照執行）】\n{user_hint.strip()}"
                 if user_hint and user_hint.strip() else ""
             )
+            protected_terms_input = st.session_state.get("protected_terms_area", "")
+            protected_section = ""
+            if protected_terms_input and protected_terms_input.strip():
+                terms_list = [t.strip() for t in protected_terms_input.strip().splitlines() if t.strip()]
+                if terms_list:
+                    protected_section = (
+                        "\n\n【禁止更改的專業術語（原文照錄，不得翻譯或替換）】\n"
+                        + "\n".join(f"・{t}" for t in terms_list)
+                    )
             kb_section = (
                 f"\n\n【精進文件內容（請優先採用以下參數）】\n{kb_text}"
                 if kb_text else "\n\n（本次未上傳精進文件，請依中運量通用規範改寫）"
@@ -911,7 +970,7 @@ with tab_result:
 6. 不適用未來線中運量的設備或條款，保留完整條文內容，並將該條款編號與不適用原因列入「=== 二、待確認事項 ===」的「建議處理」小節，正文條文本體內不得出現【建議刪除，或由機設處重新評估】等標記。
 7. 每一條款之間必須空一行，保持段落清晰易讀；禁止將所有條文連成一段文字輸出。
 8. 【禁止使用 HTML 標籤】輸出中禁止使用 <br>、<br/>、<p> 等任何 HTML 標籤，段落換行只能用空行（換兩次 Enter）表示。
-9. 請勿輸出任何問候語，直接輸出以下四個區塊。{hint_section}{kb_section}
+9. 請勿輸出任何問候語，直接輸出以下四個區塊。{hint_section}{protected_section}{kb_section}
 
 【待改寫條文】
 {old_text}
@@ -940,6 +999,7 @@ with tab_result:
 （每項以「💡」開頭，各項間空一行）
 """
             stream_box = st.empty()
+            progress_bar = st.progress(0, text="⏳ AI 改寫中，請稍候…")
             retries, success, full_text = 3, False, ""
             while not success and retries > 0:
                 try:
@@ -947,13 +1007,22 @@ with tab_result:
                     model = genai.GenerativeModel(selected_model)
                     response = model.generate_content(prompt, stream=True)
                     full_text = ""
+                    chunk_count = 0
                     for chunk in response:
                         try:
                             full_text += chunk.text
+                            chunk_count += 1
+                            progress_bar.progress(
+                                min(chunk_count / 80, 0.95),
+                                text=f"⏳ AI 改寫中… 已產出 {len(full_text):,} 字元"
+                            )
                             stream_box.markdown(full_text + " ▌")
                         except Exception:
                             pass
+                    progress_bar.progress(1.0, text="✅ 改寫完成！")
                     stream_box.empty()
+                    # 清理多餘空行（超過兩個換行壓縮為兩個）
+                    full_text = re.sub(r'\n{3,}', '\n\n', full_text)
                     st.session_state.result_text = full_text
                     chapter_label = st.session_state.get("chapter_id") or "手動輸入"
                     st.session_state.rewrite_history.insert(0, {
@@ -979,6 +1048,17 @@ with tab_result:
             if not success and retries == 0:
                 st.error("❌ 已超過重試次數，請稍後手動重試。")
             st.session_state.running = False
+            if success:
+                # 自動跳至「② 改寫結果」分頁
+                st.markdown(
+                    """<script>
+                    (function(){
+                        var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+                        if(tabs && tabs.length >= 2){ tabs[1].click(); }
+                    })();
+                    </script>""",
+                    unsafe_allow_html=True,
+                )
             st.rerun()
 
     if st.session_state.result_text:
@@ -1132,7 +1212,7 @@ with tab_result:
                 st.markdown(result_text)
 
         st.success("✅ 改寫完成！")
-        dl1, dl2 = st.columns(2)
+        dl1, dl2, dl3 = st.columns(3)
         with dl1:
             st.download_button("⬇️ 下載 Word 檔（.docx）",
                 data=result_to_docx(display_result),
@@ -1144,6 +1224,27 @@ with tab_result:
                 data=display_result.encode("utf-8"),
                 file_name="未來線中運量_改寫結果.txt",
                 mime="text/plain", use_container_width=True)
+        with dl3:
+            _html_content = f"""<!DOCTYPE html>
+<html lang="zh-TW"><head><meta charset="UTF-8">
+<title>未來線中運量_改寫結果</title>
+<style>
+  body{{font-family:'標楷體','DFKai-SB',serif;font-size:12pt;margin:2cm;line-height:1.8;}}
+  h1{{font-size:16pt;color:#1F497D;border-bottom:2px solid #1F497D;padding-bottom:6px;}}
+  h2{{font-size:13pt;color:#1F497D;}}
+  table{{border-collapse:collapse;width:100%;margin:12px 0;}}
+  th,td{{border:1px solid #999;padding:6px 10px;vertical-align:top;}}
+  th{{background:#e8edf4;font-weight:bold;}}
+  p{{margin:4px 0;}}
+  @media print{{body{{margin:1.5cm;}} button{{display:none;}}}}
+</style></head><body>
+<h1>未來線中運量機電特別技術規範 — 智慧改寫結果</h1>
+<pre style="white-space:pre-wrap;font-family:inherit;">{display_result}</pre>
+</body></html>"""
+            st.download_button("⬇️ 下載 HTML（瀏覽器可列印為 PDF）",
+                data=_html_content.encode("utf-8"),
+                file_name="未來線中運量_改寫結果.html",
+                mime="text/html", use_container_width=True)
     else:
         st.info("尚未產出結果。請至「① 輸入」分頁提供條文並執行改寫。")
 
@@ -1232,3 +1333,71 @@ with tab_refine:
                 if success:
                     st.success("✅ 精修完成！請至「② 改寫結果」查看更新後內容。")
                     st.rerun()
+
+# ══════════════════════════════════════════════════════════
+# ④ 歷史版本分頁
+# ══════════════════════════════════════════════════════════
+with tab_history:
+    st.subheader("📚 改寫歷史版本")
+    history = st.session_state.rewrite_history
+    if not history:
+        st.info("尚無歷史紀錄。完成一次改寫或精修後，版本將自動儲存於此。")
+    else:
+        st.caption(f"共 {len(history)} 個版本（最多保留 10 個，最新在最上方）")
+        for i, h in enumerate(history):
+            with st.expander(
+                f"{'🔵' if i == 0 else '⚪'} 第 {i+1} 版　{h['ts']}　｜　{h['label']}",
+                expanded=(i == 0),
+            ):
+                # 摘要數據
+                _hq = h['text'].count("❓")
+                _hw = h['text'].count("⚠️")
+                _hn = h['text'].count("▸")
+                _hd = h['text'].count("✕")
+                hc1, hc2, hc3, hc4 = st.columns(4)
+                hc1.metric("字元數", f"{len(h['text']):,}")
+                hc2.metric("❓ 待確認", _hq)
+                hc3.metric("⚠️ 建議評估", _hw)
+                hc4.metric("▸ 新增 / ✕ 調整", f"{_hn} / {_hd}")
+
+                # 預覽（只顯示「一、改寫後條文」區塊）
+                _secs = h['text'].split("===")
+                _parsed_h = {}
+                for _i in range(1, len(_secs) - 1, 2):
+                    _parsed_h[_secs[_i].strip()] = _secs[_i + 1].strip() if _i + 1 < len(_secs) else ""
+                _preview = next((c for t, c in _parsed_h.items() if t.startswith("一")), h['text'])
+                st.text_area(
+                    "條文預覽（一、改寫後條文）",
+                    value=_preview[:2000] + ("…（以下省略）" if len(_preview) > 2000 else ""),
+                    height=240, disabled=True, key=f"hist_preview_{i}",
+                )
+
+                # 操作按鈕
+                btn_col1, btn_col2, btn_col3 = st.columns(3)
+                with btn_col1:
+                    if st.button("♻️ 還原為此版本", key=f"restore_{i}", use_container_width=True, type="primary"):
+                        st.session_state.result_text = h['text']
+                        st.session_state.current_old_text_snapshot = h.get("old_text", "")
+                        st.success(f"✅ 已還原至第 {i+1} 版（{h['ts']} {h['label']}），請至「② 改寫結果」查看")
+                        st.rerun()
+                with btn_col2:
+                    st.download_button(
+                        "⬇️ 下載此版 Word",
+                        data=result_to_docx(h['text']),
+                        file_name=f"未來線中運量_v{i+1}_{h['label']}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True, key=f"dl_docx_{i}",
+                    )
+                with btn_col3:
+                    st.download_button(
+                        "⬇️ 下載此版 TXT",
+                        data=h['text'].encode("utf-8"),
+                        file_name=f"未來線中運量_v{i+1}_{h['label']}.txt",
+                        mime="text/plain",
+                        use_container_width=True, key=f"dl_txt_{i}",
+                    )
+
+        st.markdown("---")
+        if st.button("🗑️ 清除所有歷史紀錄", use_container_width=False):
+            st.session_state.rewrite_history = []
+            st.rerun()
