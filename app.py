@@ -8,6 +8,7 @@ import io
 import time
 import base64
 import re
+import datetime
 
 # ── 頁面設定 ──────────────────────────────────────────────
 st.set_page_config(page_title="未來線中運量機電特別技術規範 - 智慧改寫平台", layout="wide")
@@ -18,12 +19,16 @@ for key, val in [
     ("extracted_old_text", ""),
     ("cf620_total_pages", 0),
     ("cf620_toc", []),
-    ("cf620_toc_raw", []),          # 邏輯頁碼（未套偏移）
-    ("cf620_detected_offset", 0),   # Gemini 自動偵測的偏移
+    ("cf620_toc_raw", []),
+    ("cf620_detected_offset", 0),
     ("pdf_bytes_cache", None),
     ("chapter_id", ""),
     ("next_chapter_id", ""),
     ("cf620_pdf_name", ""),
+    ("kb_cache_key", None),
+    ("kb_text_cache", ""),
+    ("rewrite_history", []),          # 歷史紀錄：list of {ts, label, text, old_text}
+    ("current_old_text_snapshot", ""),# 最新一次改寫時的原文快照
 ]:
     if key not in st.session_state:
         st.session_state[key] = val
@@ -35,6 +40,7 @@ def set_running():
 # 工具函式
 # ══════════════════════════════════════════════════════════
 
+@st.cache_data(show_spinner=False)
 def detect_toc_pages(file_bytes, max_scan=20):
     """偵測前 max_scan 頁中目錄頁（章節編號密度高的頁面），回傳 page_no list（0-based）"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -48,6 +54,7 @@ def detect_toc_pages(file_bytes, max_scan=20):
     return toc_pages, len(doc)
 
 
+@st.cache_data(show_spinner=False)
 def render_page_to_png(file_bytes, page_no, dpi=150):
     """將 PDF 指定頁（0-based）render 成 PNG bytes"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -176,6 +183,7 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
     return toc, toc_raw, offset, total
 
 
+@st.cache_data(show_spinner=False)
 def extract_pages(file_bytes, page_start, page_end):
     """萃取指定頁碼範圍（1-based），保留表格結構，過濾頁首頁尾"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -264,8 +272,8 @@ def trim_to_chapter(text, chapter_id, next_chapter_id=None):
     return "\n".join(lines[start_idx:end_idx]).strip()
 
 
+@st.cache_data(show_spinner=False)
 def extract_pdf_with_tables(file_bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
     all_text = ""
     for page in doc:
         try:
@@ -445,25 +453,32 @@ with st.sidebar:
 
 kb_text = ""
 if uploaded_files:
-    for f in uploaded_files:
-        try:
-            if f.name.lower().endswith(".pdf"):
-                kb_text += extract_pdf_with_tables(f.read())
-            elif f.name.lower().endswith(".docx"):
-                wd = docx.Document(io.BytesIO(f.read()))
-                for para in wd.paragraphs:
-                    kb_text += para.text + "\n"
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ 無法讀取 {f.name}：{e}")
-    st.sidebar.success(f"✅ 成功載入 {len(uploaded_files)} 份精進文件！")
+    # 用檔名+大小當 cache key，只有真的換檔案才重新萃取
+    kb_cache_key = tuple((f.name, f.size) for f in uploaded_files)
+    if st.session_state.get("kb_cache_key") != kb_cache_key:
+        _kb = ""
+        for f in uploaded_files:
+            try:
+                raw = f.read()
+                if f.name.lower().endswith(".pdf"):
+                    _kb += extract_pdf_with_tables(raw)
+                elif f.name.lower().endswith(".docx"):
+                    wd = docx.Document(io.BytesIO(raw))
+                    for para in wd.paragraphs:
+                        _kb += para.text + "\n"
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ 無法讀取 {f.name}：{e}")
+        st.session_state["kb_text_cache"] = _kb
+        st.session_state["kb_cache_key"] = kb_cache_key
+        st.sidebar.success(f"✅ 成功載入 {len(uploaded_files)} 份精進文件！")
+    kb_text = st.session_state.get("kb_text_cache", "")
 
 # ══════════════════════════════════════════════════════════
-# 主畫面
+# 主畫面（上：輸入區 / 下：結果區，不分頁以免需要手動切換）
 # ══════════════════════════════════════════════════════════
 st.markdown("---")
-col1, col2 = st.columns(2)
 
-with col1:
+with st.container():
     st.subheader("📝 ① 上傳 預修改之PTS")
 
     tab_pdf, tab_paste, tab_img = st.tabs([
@@ -641,17 +656,18 @@ with col1:
                 st.success(f"✅ 即將萃取第 {auto_start} ～ {min(auto_end, total_pages)} 頁（共 {page_count_preview} 頁）")
 
             # 預設值（expander 未展開時使用）
-            page_start = auto_start
-            page_end   = min(auto_end, total_pages)
+            page_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
+            page_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
 
             with st.expander("🔧 手動調整頁碼範圍（選用）", expanded=False):
                 st.caption("若自動計算的頁碼範圍不正確，可在此手動修改")
                 c_s, c_e = st.columns(2)
+                _safe_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
+                _safe_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
                 with c_s:
-                    page_start = st.number_input("起始頁", 1, total_pages, auto_start)
+                    page_start = st.number_input("起始頁", 1, max(1, total_pages), _safe_start)
                 with c_e:
-                    page_end = st.number_input("結束頁", 1, total_pages,
-                                               min(auto_end, total_pages))
+                    page_end = st.number_input("結束頁", 1, max(1, total_pages), _safe_end)
                 page_count = page_end - page_start + 1
                 if page_count > 30:
                     st.warning(f"⚠️ 選取 {page_count} 頁，建議不超過 30 頁。")
@@ -716,14 +732,17 @@ with col1:
     clear_btn = st.button("✏️ 清除結果", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════
-# 右欄：輸出
+# 結果區（緊接在輸入區下方）
 # ══════════════════════════════════════════════════════════
-with col2:
+st.markdown("---")
+with st.container():
     st.subheader("✨ ② 智慧改寫草稿")
 
     if clear_btn:
         st.session_state.result_text = ""
         st.session_state.extracted_old_text = ""
+        st.session_state.rewrite_history = []
+        st.session_state.current_old_text_snapshot = ""
         st.rerun()
 
     if run_btn:
@@ -758,8 +777,8 @@ with col2:
    - 每一個測試項目（如 A.車廂地板防火測試、B.車間走道防火測試）都必須是表格中獨立的一列（row），不得拆到表格外
    - 說明欄中若有多個子條件（1. 2. 3.…），全部寫在同一格內，子條件之間用「；」分隔，不得換行成表格外的條列
    - 禁止在表格行之間插入任何非表格文字或空行
-5. 優先採用精進文件中的最新中運量規格參數；若未提及，則保留原始數值並標註〔待確認〕。
-6. 不適用未來線中運量的設備或條款，保留完整條文內容並在結尾標註【建議刪除，或由機設處重新評估】。
+5. 優先採用精進文件中的最新中運量規格參數；若未提及，則保留原始數值，並將該條款編號與說明列入「=== 二、待確認事項 ===」，正文條文本體內不得出現〔待確認〕等標記。
+6. 不適用未來線中運量的設備或條款，保留完整條文內容，並將該條款編號與不適用原因列入「=== 二、待確認事項 ===」的「建議處理」小節，正文條文本體內不得出現【建議刪除，或由機設處重新評估】等標記。
 7. 每一條款之間必須空一行，保持段落清晰易讀；禁止將所有條文連成一段文字輸出。
 8. 【禁止使用 HTML 標籤】輸出中禁止使用 <br>、<br/>、<p> 等任何 HTML 標籤，段落換行只能用空行（換兩次 Enter）表示。
 9. 請勿輸出任何問候語，直接輸出以下四個區塊。{hint_section}{kb_section}
@@ -772,24 +791,320 @@ with col2:
 
 === 一、改寫後條文 ===
 （完整改寫版條文，保留編號格式，各條款間空一行，表格用 Markdown 呈現）
+（⚠️ 本區塊內容必須完全乾淨，禁止出現〔待確認〕、【建議刪除】等任何標記符號）
 
-=== 二、新增內容摘要 ===
+=== 二、待確認事項與建議處理項目 ===
+【❓ 待確認項目】
+（每項以「❓」開頭，格式：條款編號 → 待確認說明，各項間空一行）
+
+【⚠️ 建議刪除或由機設處重新評估】
+（每項以「⚠️」開頭，格式：條款編號 → 不適用原因，各項間空一行）
+
+=== 三、新增內容摘要 ===
 （每項以「▸」開頭，各項間空一行）
 
-=== 三、刪除 / 調整內容摘要 ===
+=== 四、刪除 / 調整內容摘要 ===
 （每項以「✕」開頭，各項間空一行）
 
-=== 四、專業意見與注意事項 ===
+=== 五、專業意見與注意事項 ===
 （每項以「💡」開頭，各項間空一行）
 """
-            with st.spinner(f"⏳ 使用 {selected_model} 改寫中..."):
-                retries, success = 3, False
+            # ── 串流改寫 ──────────────────────────────────────
+            stream_box = st.empty()
+            retries, success, full_text = 3, False, ""
+            while not success and retries > 0:
+                try:
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel(selected_model)
+                    response = model.generate_content(prompt, stream=True)
+                    full_text = ""
+                    for chunk in response:
+                        try:
+                            full_text += chunk.text
+                            stream_box.markdown(full_text + " ▌")
+                        except Exception:
+                            pass
+                    stream_box.empty()
+                    st.session_state.result_text = full_text
+                    # ── 寫入歷史 ──────────────────────────────
+                    chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                    st.session_state.rewrite_history.insert(0, {
+                        "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
+                        "label":    chapter_label,
+                        "text":     full_text,
+                        "old_text": old_text,
+                    })
+                    st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                    st.session_state.current_old_text_snapshot = old_text
+                    success = True
+                except Exception as e:
+                    err = str(e)
+                    if "429" in err or "quota" in err.lower():
+                        retries -= 1
+                        if retries > 0:
+                            st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
+                            time.sleep(15)
+                    elif "API_KEY_INVALID" in err or "api key" in err.lower():
+                        st.error("❌ API Key 無效。"); break
+                    else:
+                        st.error(f"❌ 錯誤：{err}"); break
+            if not success and retries == 0:
+                st.error("❌ 已超過重試次數，請稍後手動重試。")
+
+            st.session_state.running = False
+            st.rerun()
+
+    if st.session_state.result_text:
+
+        # ── 歷史記錄選擇器 ────────────────────────────────────
+        history = st.session_state.rewrite_history
+        if len(history) > 1:
+            history_labels = [
+                f"第{i+1}版　{h['ts']}　{h['label']}"
+                for i, h in enumerate(history)
+            ]
+            sel_label = st.selectbox(
+                "📋 歷史版本",
+                history_labels,
+                index=0,
+                key="history_select",
+            )
+            sel_idx = history_labels.index(sel_label)
+            display_result  = history[sel_idx]["text"]
+            display_old     = history[sel_idx]["old_text"]
+        else:
+            display_result  = st.session_state.result_text
+            display_old     = st.session_state.get("current_old_text_snapshot", "")
+
+        # ── 新舊對照 / 一般模式切換 ──────────────────────────
+        compare_mode = st.toggle("📊 新舊對照模式（原文 ↔ 改寫）", key="compare_toggle")
+
+        if compare_mode:
+            # 取出 section 一 的改寫後條文
+            _secs = display_result.split("===")
+            _parsed_for_compare = {}
+            for _i in range(1, len(_secs) - 1, 2):
+                _parsed_for_compare[_secs[_i].strip()] = (
+                    _secs[_i + 1].strip() if _i + 1 < len(_secs) else ""
+                )
+            section_one_text = next(
+                (c for t, c in _parsed_for_compare.items() if t.startswith("一")),
+                display_result,
+            )
+            left_col, right_col = st.columns(2)
+            with left_col:
+                st.caption("📄 原始條文")
+                st.text_area(
+                    "原始", value=display_old or "（無原始條文快照）",
+                    height=600, disabled=True, label_visibility="collapsed",
+                    key="orig_view",
+                )
+            with right_col:
+                st.caption("✨ 改寫後條文（一、）")
+                st.text_area(
+                    "改寫", value=section_one_text,
+                    height=600, disabled=True, label_visibility="collapsed",
+                    key="rewrite_view",
+                )
+        else:
+            # ── 一般結構化顯示 ────────────────────────────────
+            result_text = display_result
+            sections = result_text.split("===")
+            parsed = {}
+            for i in range(1, len(sections) - 1, 2):
+                title = sections[i].strip()
+                content = sections[i + 1].strip() if i + 1 < len(sections) else ""
+                parsed[title] = content
+
+            emoji_map = {"一": "📄", "二": "⚠️", "三": "🆕", "四": "🗑️", "五": "💡"}
+            if parsed:
+                for title, content in parsed.items():
+                    emoji = emoji_map.get(title[0] if title else "", "📌")
+                    with st.expander(f"{emoji} {title}", expanded=title.startswith("一")):
+
+                        def parse_md_table_to_html(md_lines):
+                            html = ['<table border="1" style="border-collapse:collapse;width:100%;font-size:0.9em;">']
+                            is_header = True
+                            for row in md_lines:
+                                if re.match(r"^\|[-:\s|]+\|$", row.strip()):
+                                    is_header = False
+                                    continue
+                                cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                                tag = "th" if is_header else "td"
+                                style = "padding:6px 10px;vertical-align:top;border:1px solid #ccc;"
+                                if is_header:
+                                    style += "background:#f0f0f0;font-weight:bold;"
+                                row_html = "<tr>" + "".join(
+                                    f'<{tag} style="{style}">{format_cell(c)}</{tag}>'
+                                    for c in cells
+                                ) + "</tr>"
+                                html.append(row_html)
+                            html.append("</table>")
+                            return "\n".join(html)
+
+                        def format_cell(text):
+                            import html as html_mod
+                            if text is None:
+                                return ""
+                            text = str(text)
+                            text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                            text = text.replace("\r\n", "\n").replace("\r", "\n")
+                            text = re.sub(r"\s*；\s*", "；", text)
+                            item_pat = re.compile(r"(?<![\d.])(\d{1,2})[.、]\s*(?!\d)")
+                            matches = list(item_pat.finditer(text))
+                            if matches:
+                                preamble = text[:matches[0].start()].strip("；; \n\t")
+                                items = []
+                                for idx, match in enumerate(matches):
+                                    item_start = match.end()
+                                    item_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                                    item_text = text[item_start:item_end].strip("；; \n\t")
+                                    if item_text:
+                                        items.append(item_text)
+                                if items:
+                                    first_number = matches[0].group(1)
+                                    prefix = (
+                                        f"<p style='margin:0 0 4px 0;'>{html_mod.escape(preamble)}</p>"
+                                        if preamble else ""
+                                    )
+                                    li_items = "".join(
+                                        f"<li>{html_mod.escape(item).replace(chr(10), '<br>')}</li>"
+                                        for item in items
+                                    )
+                                    return (
+                                        f"{prefix}"
+                                        f"<ol start='{first_number}' style='margin:0;padding-left:1.4em;'>"
+                                        f"{li_items}"
+                                        f"</ol>"
+                                    )
+                            return html_mod.escape(text).replace("\n", "<br>")
+
+                        lines = content.split("\n")
+                        output_parts = []
+                        i = 0
+                        while i < len(lines):
+                            stripped = lines[i].strip()
+                            if stripped.startswith("|"):
+                                tbl_rows = []
+                                while i < len(lines) and (lines[i].strip().startswith("|") or
+                                      (not lines[i].strip() and i+1 < len(lines) and lines[i+1].strip().startswith("|"))):
+                                    if lines[i].strip():
+                                        tbl_rows.append(lines[i].strip())
+                                    i += 1
+                                output_parts.append(("table", tbl_rows))
+                            else:
+                                md_lines = []
+                                while i < len(lines) and not lines[i].strip().startswith("|"):
+                                    md_lines.append(lines[i])
+                                    i += 1
+                                output_parts.append(("md", md_lines))
+
+                        final_html_parts = []
+                        for part_type, part_data in output_parts:
+                            if part_type == "table":
+                                final_html_parts.append(parse_md_table_to_html(part_data))
+                            else:
+                                md_text = ""
+                                for ln in part_data:
+                                    s = ln.strip()
+                                    md_text += ln + "\n"
+                                    if s and not s.startswith("---") and not s.startswith("|"):
+                                        md_text += "\n"
+                                if md_text.strip():
+                                    final_html_parts.append(f"MARKDOWN_BLOCK:{md_text}")
+
+                        for part in final_html_parts:
+                            if part.startswith("MARKDOWN_BLOCK:"):
+                                st.markdown(part[len("MARKDOWN_BLOCK:"):])
+                            else:
+                                st.markdown(part, unsafe_allow_html=True)
+            else:
+                st.markdown(result_text)
+
+        st.success("✅ 改寫完成！")
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                "⬇️ 下載 Word 檔（.docx）",
+                data=result_to_docx(display_result),
+                file_name="未來線中運量_改寫結果.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+        with dl_col2:
+            st.download_button(
+                "⬇️ 下載純文字（.txt）",
+                data=display_result.encode("utf-8"),
+                file_name="未來線中運量_改寫結果.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+        # ── 後續修改指令 ──────────────────────────────────────
+        st.markdown("---")
+        st.subheader("🔄 後續修改指令")
+        st.caption("針對上方改寫結果，輸入補充指令後，AI 將依指令進行二次精修")
+        post_hint = st.text_area(
+            "輸入修改指令",
+            height=120,
+            placeholder="例如：\n・請將第 3.1.2 條的電壓改為 750V DC\n・把第 3.2 條表格的測試時間全部改為 30 分鐘\n・幫我刪除第 3.3 條整條",
+            label_visibility="collapsed",
+            key="post_hint_area",
+        )
+        post_btn = st.button(
+            "🔄 依指令修改改寫結果",
+            use_container_width=True,
+            type="secondary",
+            disabled=st.session_state.running,
+        )
+
+        if post_btn:
+            if not post_hint or not post_hint.strip():
+                st.warning("⚠️ 請先輸入修改指令！")
+            elif not api_key:
+                st.error("⚠️ 請先在側欄輸入 Gemini API Key！")
+            else:
+                refine_prompt = f"""你是一位具備捷運機電系統工程與合約撰寫背景的資深專家。
+
+【任務】
+以下是一份已改寫完成的技術規範草稿，請依照「修改指令」對其進行調整，並完整保留未被指令影響的部分不變。
+
+【修改指令】
+{post_hint.strip()}
+
+【現有改寫草稿】
+{result_text}
+
+【輸出要求】
+- 請直接輸出修改後的完整草稿，格式與分區（=== 一、... === 二、... 等）保持不變
+- 不要輸出任何問候語或說明，直接輸出修改後的草稿
+- 一、改寫後條文 區塊內容必須乾淨，不得出現〔待確認〕、【建議刪除】等標記
+"""
+                stream_box2 = st.empty()
+                retries, success, full_text = 3, False, ""
                 while not success and retries > 0:
                     try:
                         genai.configure(api_key=api_key)
                         model = genai.GenerativeModel(selected_model)
-                        response = model.generate_content(prompt)
-                        st.session_state.result_text = response.text
+                        response = model.generate_content(refine_prompt, stream=True)
+                        full_text = ""
+                        for chunk in response:
+                            try:
+                                full_text += chunk.text
+                                stream_box2.markdown(full_text + " ▌")
+                            except Exception:
+                                pass
+                        stream_box2.empty()
+                        st.session_state.result_text = full_text
+                        # 寫入歷史（精修版）
+                        chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                        st.session_state.rewrite_history.insert(0, {
+                            "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
+                            "label":    f"{chapter_label}（精修）",
+                            "text":     full_text,
+                            "old_text": st.session_state.get("current_old_text_snapshot", ""),
+                        })
+                        st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
                         success = True
                     except Exception as e:
                         err = str(e)
@@ -798,181 +1113,12 @@ with col2:
                             if retries > 0:
                                 st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
                                 time.sleep(15)
-                        elif "API_KEY_INVALID" in err or "api key" in err.lower():
-                            st.error("❌ API Key 無效。"); break
                         else:
                             st.error(f"❌ 錯誤：{err}"); break
                 if not success and retries == 0:
                     st.error("❌ 已超過重試次數，請稍後手動重試。")
-
-            st.session_state.running = False
-            st.rerun()
-
-    if st.session_state.result_text:
-        result_text = st.session_state.result_text
-        sections = result_text.split("===")
-        parsed = {}
-        for i in range(1, len(sections) - 1, 2):
-            title = sections[i].strip()
-            content = sections[i + 1].strip() if i + 1 < len(sections) else ""
-            parsed[title] = content
-
-        emoji_map = {"一": "📄", "二": "🆕", "三": "🗑️", "四": "💡"}
-        if parsed:
-            for title, content in parsed.items():
-                emoji = emoji_map.get(title[0] if title else "", "📌")
-                with st.expander(f"{emoji} {title}", expanded=title.startswith("一")):
-                    # ── 渲染處理：Markdown 表格 → HTML 表格 + 段落換行 ────
-                    # Markdown 表格儲存格不支援換行，改用 HTML 表格確保條列正確顯示
-
-                    def parse_md_table_to_html(md_lines):
-                        """將連續的 Markdown 表格行轉換為 HTML 表格（支援儲存格內換行）"""
-                        html = ['<table border="1" style="border-collapse:collapse;width:100%;font-size:0.9em;">']
-                        is_header = True
-                        for row in md_lines:
-                            # 跳過分隔線
-                            if re.match(r"^\|[-:\s|]+\|$", row.strip()):
-                                is_header = False
-                                continue
-                            # 解析儲存格（去掉首尾 |，再 split）
-                            cells = [c.strip() for c in row.strip().strip("|").split("|")]
-                            tag = "th" if is_header else "td"
-                            style = "padding:6px 10px;vertical-align:top;border:1px solid #ccc;"
-                            if is_header:
-                                style += "background:#f0f0f0;font-weight:bold;"
-                            row_html = "<tr>" + "".join(
-                                f'<{tag} style="{style}">{format_cell(c)}</{tag}>'
-                                for c in cells
-                            ) + "</tr>"
-                            html.append(row_html)
-                        html.append("</table>")
-                        return "\n".join(html)
-
-                    def format_cell(text):
-                        """
-                        儲存格內容格式化：
-                        - 修正「1. xxx；2. yyy；3. zzz」時，原本第 1 點被當成前言，
-                          導致第 2 點在畫面上變成清單第 1 點的問題。
-                        - 將所有連續數字條列轉成同一個 <ol>，並保留原本第一個數字作為 start。
-                        """
-                        import html as html_mod
-
-                        if text is None:
-                            return ""
-
-                        text = str(text)
-                        text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                        text = text.replace("\r\n", "\n").replace("\r", "\n")
-                        text = re.sub(r"\s*；\s*", "；", text)
-
-                        # 找出條列編號，例如：1.、2.、3、，但排除 2.1、3.2.1 這類章節或小數。
-                        # 舊版 bug 是先用第一個分號切前言，導致「1. ...；2. ...」的第 1 點被當成前言，
-                        # 畫面上只剩第 2 點進入 <ol>，因此第 2 點會顯示成清單第 1 點。
-                        item_pat = re.compile(r"(?<![\d.])(\d{1,2})[.、]\s*(?!\d)")
-                        matches = list(item_pat.finditer(text))
-
-                        if matches:
-                            preamble = text[:matches[0].start()].strip("；; \n\t")
-                            items = []
-
-                            for idx, match in enumerate(matches):
-                                item_start = match.end()
-                                item_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-                                item_text = text[item_start:item_end].strip("；; \n\t")
-
-                                if item_text:
-                                    items.append(item_text)
-
-                            if items:
-                                first_number = matches[0].group(1)
-                                prefix = (
-                                    f"<p style='margin:0 0 4px 0;'>{html_mod.escape(preamble)}</p>"
-                                    if preamble else ""
-                                )
-                                li_items = "".join(
-                                    f"<li>{html_mod.escape(item).replace(chr(10), '<br>')}</li>"
-                                    for item in items
-                                )
-                                return (
-                                    f"{prefix}"
-                                    f"<ol start='{first_number}' style='margin:0;padding-left:1.4em;'>"
-                                    f"{li_items}"
-                                    f"</ol>"
-                                )
-
-                        return html_mod.escape(text).replace("\n", "<br>")
-
-
-                    # 逐行分組：表格行 vs 一般段落行
-                    lines = content.split("\n")
-                    output_parts = []   # 每個元素為 ("md", text) 或 ("table", [行列表])
-                    i = 0
-                    while i < len(lines):
-                        line = lines[i]
-                        stripped = line.strip()
-                        if stripped.startswith("|"):
-                            # 收集完整表格（包含後面緊接的空白行跳過，直到下一個 | 行）
-                            tbl_rows = []
-                            while i < len(lines) and (lines[i].strip().startswith("|") or
-                                  (not lines[i].strip() and i+1 < len(lines) and lines[i+1].strip().startswith("|"))):
-                                if lines[i].strip():
-                                    tbl_rows.append(lines[i].strip())
-                                i += 1
-                            output_parts.append(("table", tbl_rows))
-                        else:
-                            # 收集到下一個表格行或結束
-                            md_lines = []
-                            while i < len(lines) and not lines[i].strip().startswith("|"):
-                                md_lines.append(lines[i])
-                                i += 1
-                            output_parts.append(("md", md_lines))
-
-                    # 渲染各分組
-                    final_html_parts = []
-                    for part_type, part_data in output_parts:
-                        if part_type == "table":
-                            final_html_parts.append(parse_md_table_to_html(part_data))
-                        else:
-                            # 一般 Markdown 段落：補空行確保換行
-                            md_text = ""
-                            for ln in part_data:
-                                s = ln.strip()
-                                md_text += ln + "\n"
-                                if s and not s.startswith("---") and not s.startswith("|"):
-                                    md_text += "\n"
-                            if md_text.strip():
-                                # 轉為 HTML 段落（保留 Markdown 格式）
-                                import html as html_mod
-                                # 直接用 st.markdown 輸出非表格部分
-                                final_html_parts.append(f"MARKDOWN_BLOCK:{md_text}")
-
-                    # 輸出：HTML 表格用 st.markdown(unsafe_allow_html=True)，
-                    # Markdown 段落仍用 st.markdown
-                    for part in final_html_parts:
-                        if part.startswith("MARKDOWN_BLOCK:"):
-                            st.markdown(part[len("MARKDOWN_BLOCK:"):])
-                        else:
-                            st.markdown(part, unsafe_allow_html=True)
-        else:
-            st.markdown(result_text)
-
-        st.success("✅ 改寫完成！")
-        dl_col1, dl_col2 = st.columns(2)
-        with dl_col1:
-            st.download_button(
-                "⬇️ 下載 Word 檔（.docx）",
-                data=result_to_docx(result_text),
-                file_name="未來線中運量_改寫結果.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
-        with dl_col2:
-            st.download_button(
-                "⬇️ 下載純文字（.txt）",
-                data=result_text.encode("utf-8"),
-                file_name="未來線中運量_改寫結果.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+                if success:
+                    st.success("✅ 精修完成！")
+                    st.rerun()
     else:
         st.info("尚未產出結果。")
