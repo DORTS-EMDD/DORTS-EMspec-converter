@@ -616,6 +616,18 @@ tab_input, tab_result, tab_refine, tab_history = st.tabs([
     "　④ 歷史版本　",
 ])
 
+# ── 改寫完成後自動跳至 ② 分頁（rerun 後在此觸發，DOM 已就緒）──
+if st.session_state.pop("_switch_to_result", False):
+    st.markdown(
+        """<script>
+        setTimeout(function(){
+            var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+            if(tabs && tabs.length >= 2){ tabs[1].click(); }
+        }, 400);
+        </script>""",
+        unsafe_allow_html=True,
+    )
+
 # ══════════════════════════════════════════════════════════
 # ① 輸入分頁
 # ══════════════════════════════════════════════════════════
@@ -1025,14 +1037,17 @@ with tab_result:
                     full_text = re.sub(r'\n{3,}', '\n\n', full_text)
                     st.session_state.result_text = full_text
                     chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                    _tw_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
                     st.session_state.rewrite_history.insert(0, {
-                        "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
+                        "ts":       _tw_now.strftime("%m/%d %H:%M"),
                         "label":    chapter_label,
                         "text":     full_text,
                         "old_text": old_text,
                     })
                     st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
                     st.session_state.current_old_text_snapshot = old_text
+                    # 清除歷史選單 session state，確保下次顯示最新版
+                    st.session_state.pop("history_select", None)
                     success = True
                 except Exception as e:
                     err = str(e)
@@ -1049,16 +1064,7 @@ with tab_result:
                 st.error("❌ 已超過重試次數，請稍後手動重試。")
             st.session_state.running = False
             if success:
-                # 自動跳至「② 改寫結果」分頁
-                st.markdown(
-                    """<script>
-                    (function(){
-                        var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
-                        if(tabs && tabs.length >= 2){ tabs[1].click(); }
-                    })();
-                    </script>""",
-                    unsafe_allow_html=True,
-                )
+                st.session_state["_switch_to_result"] = True
             st.rerun()
 
     if st.session_state.result_text:
@@ -1311,13 +1317,16 @@ with tab_refine:
                         stream_box2.empty()
                         st.session_state.result_text = full_text
                         chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                        _tw_now2 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
                         st.session_state.rewrite_history.insert(0, {
-                            "ts":       datetime.datetime.now().strftime("%m/%d %H:%M"),
+                            "ts":       _tw_now2.strftime("%m/%d %H:%M"),
                             "label":    f"{chapter_label}（精修）",
                             "text":     full_text,
                             "old_text": st.session_state.get("current_old_text_snapshot", ""),
                         })
                         st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                        # 清除歷史選單 session state，確保顯示最新精修版
+                        st.session_state.pop("history_select", None)
                         success = True
                     except Exception as e:
                         err = str(e)
@@ -1376,9 +1385,19 @@ with tab_history:
                 btn_col1, btn_col2, btn_col3 = st.columns(3)
                 with btn_col1:
                     if st.button("♻️ 還原為此版本", key=f"restore_{i}", use_container_width=True, type="primary"):
+                        _tw_now3 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+                        st.session_state.rewrite_history.insert(0, {
+                            "ts":       _tw_now3.strftime("%m/%d %H:%M"),
+                            "label":    f"{h['label']}（還原）",
+                            "text":     h['text'],
+                            "old_text": h.get("old_text", ""),
+                        })
+                        st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
                         st.session_state.result_text = h['text']
                         st.session_state.current_old_text_snapshot = h.get("old_text", "")
-                        st.success(f"✅ 已還原至第 {i+1} 版（{h['ts']} {h['label']}），請至「② 改寫結果」查看")
+                        # 清除歷史選單 key，讓 ② 分頁自動顯示剛還原的最新版
+                        st.session_state.pop("history_select", None)
+                        st.success(f"✅ 已還原至「{h['label']}」版本，請至「② 改寫結果」查看")
                         st.rerun()
                 with btn_col2:
                     st.download_button(
