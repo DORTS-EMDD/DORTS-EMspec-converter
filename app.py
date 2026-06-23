@@ -9,6 +9,7 @@ import time
 import base64
 import re
 import datetime
+import pathlib
 
 # ── 頁面設定 ──────────────────────────────────────────────
 st.set_page_config(page_title="未來線中運量機電特別技術規範 - 智慧改寫平台", layout="wide")
@@ -608,6 +609,23 @@ st.markdown(
       .stTabs [data-baseweb="tab"] {height: 46px; font-size: 1.02rem; font-weight: 600;}
       .pts-hint {background:#f6f8fa;border-left:4px solid #4c8bf5;padding:10px 14px;
                  border-radius:6px;font-size:0.9rem;color:#444;margin-bottom:8px;}
+      .workbench-band {background:#f7f9fc;border:1px solid #dce3ee;border-radius:8px;
+                       padding:14px 16px;margin:4px 0 14px 0;}
+      .workbench-title {font-size:1.05rem;font-weight:700;color:#1f2937;margin-bottom:4px;}
+      .workbench-sub {font-size:.9rem;color:#4b5563;}
+      .ai-card {border:1px solid #d8e0eb;border-radius:8px;padding:12px 14px;background:#ffffff;}
+      .ai-card-label {font-size:.82rem;color:#667085;margin-bottom:4px;}
+      .ai-card-value {font-size:1.35rem;font-weight:800;color:#1f2937;}
+      .review-box {border-left:5px solid #f59e0b;background:#fff7ed;border-radius:6px;
+                   padding:10px 12px;margin:8px 0;}
+      .risk-box {border-left:5px solid #ef4444;background:#fff1f2;border-radius:6px;
+                 padding:10px 12px;margin:8px 0;}
+      .new-box {border-left:5px solid #16a34a;background:#f0fdf4;border-radius:6px;
+                padding:10px 12px;margin:8px 0;}
+      .keep-box {border-left:5px solid #2563eb;background:#eff6ff;border-radius:6px;
+                 padding:10px 12px;margin:8px 0;}
+      .demo-box {border:1px solid #b8c7dd;background:#f8fbff;border-radius:8px;
+                 padding:12px 14px;margin-bottom:12px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -789,6 +807,88 @@ def generate_with_progress(prompt, model_name, api_key, progress_bar, progress_l
     return success, full_text
 
 
+def find_demo_pdf():
+    app_dir = pathlib.Path(__file__).resolve().parent
+    candidates = [
+        app_dir / "2改寫規範" / "1-15 PTS 萬大.pdf",
+        pathlib.Path(r"C:\Users\12124\Desktop\PTS AI\2改寫規範\1-15 PTS 萬大.pdf"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, "rb") as f:
+                return path, f.read()
+        except Exception:
+            pass
+    return None, None
+
+
+def load_demo_excerpt():
+    demo_path, demo_bytes = find_demo_pdf()
+    if not demo_bytes:
+        return False, "找不到展示用 PDF：2改寫規範/1-15 PTS 萬大.pdf"
+    extracted, _ = extract_pages(demo_bytes, 10, 15)
+    extracted = trim_to_chapter(extracted, "1.1", "1.6")
+    st.session_state.pdf_bytes_cache = demo_bytes
+    st.session_state.cf620_pdf_name = "1-15 PTS 萬大.pdf"
+    st.session_state.extracted_old_text = extracted
+    st.session_state.chapter_id = "1.1"
+    st.session_state.next_chapter_id = "1.6"
+    return True, f"已載入展示範圍：1.1～1.5（{len(extracted):,} 字）"
+
+
+def parse_result_sections(result_text):
+    sections = result_text.split("===")
+    parsed = {}
+    for i in range(1, len(sections) - 1, 2):
+        title = sections[i].strip()
+        content = sections[i + 1].strip() if i + 1 < len(sections) else ""
+        parsed[title] = content
+    return parsed
+
+
+def main_clause_count(text):
+    parsed = parse_result_sections(text)
+    main = next((c for t, c in parsed.items() if t.startswith("一")), text)
+    return len(re.findall(r"(?m)^\s*\d+(?:\.\d+)+\s+", main))
+
+
+def render_summary_card(label, value):
+    st.markdown(
+        f"""<div class="ai-card">
+        <div class="ai-card-label">{label}</div>
+        <div class="ai-card-value">{value}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_review_lines(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    shown = False
+    for ln in lines:
+        if ln.startswith("❓"):
+            st.markdown(f'<div class="review-box">{ln}</div>', unsafe_allow_html=True)
+            shown = True
+        elif ln.startswith("⚠️"):
+            st.markdown(f'<div class="risk-box">{ln}</div>', unsafe_allow_html=True)
+            shown = True
+    if not shown:
+        st.info("目前沒有待確認或風險條款。")
+
+
+def render_colored_section(title, content):
+    css = "keep-box"
+    if title.startswith("二"):
+        css = "review-box"
+    elif title.startswith("三"):
+        css = "new-box"
+    elif title.startswith("四"):
+        css = "risk-box"
+    elif title.startswith("五"):
+        css = "keep-box"
+    st.markdown(f'<div class="{css}"><strong>{title}</strong></div>', unsafe_allow_html=True)
+
+
 # ── 改寫/還原完成後自動跳至 ② 分頁（st.tabs 無原生 API，故用前端點擊）──
 _switch_payload = st.session_state.pop("_switch_to_result", None)
 if _switch_payload:
@@ -802,11 +902,18 @@ if _switch_payload:
 # ① 輸入分頁
 # ══════════════════════════════════════════════════════════
 with tab_input:
+    st.markdown(
+        """<div class="workbench-band">
+        <div class="workbench-title">競賽展示工作台</div>
+        <div class="workbench-sub">左側選擇文件與章節範圍，右側設定改寫方向與執行狀態；完成後自動進入 AI 改寫結果。</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
     in_main, in_side = st.columns([3, 2], gap="large")
 
     # ── 左大欄：條文來源（PDF / 貼上 / 截圖） ──
     with in_main:
-        st.subheader("📥 條文來源")
+        st.subheader("📂 文件與章節選擇")
         src_pdf, src_paste, src_img = st.tabs([
             "📄 上傳 PDF（推薦）", "✍️ 直接貼上", "🖼️ 截圖辨識",
         ])
@@ -1070,6 +1177,24 @@ with tab_input:
 
     # ── 右窄欄：改寫方向提示語（從 sidebar 搬來，避免 sidebar 太擠） ──
     with in_side:
+        st.subheader("🎯 改寫控制台")
+        st.markdown(
+            """<div class="demo-box">
+            <strong>展示用 Demo</strong><br>
+            一鍵載入萬大線範例 PDF 的 1.1～1.5，適合競賽現場快速展示完整流程。
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        if st.button("⚡ 載入 Demo 並執行 AI 改寫", use_container_width=True, type="primary"):
+            ok, msg = load_demo_excerpt()
+            if ok:
+                st.session_state["_demo_auto_run"] = True
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        st.markdown("---")
         st.subheader("✏️ 改寫方向提示語")
         st.caption("可填改寫方向、特殊要求或精進文字（選填），AI 改寫時一併參考")
         user_hint = st.text_area(
@@ -1095,6 +1220,7 @@ with tab_input:
     with bc1:
         run_btn = st.button("🚀 執行 AI 改寫（結果顯示於「② 改寫結果」）",
             disabled=st.session_state.running, use_container_width=True, type="primary")
+        run_btn = run_btn or st.session_state.pop("_demo_auto_run", False)
     with bc2:
         clear_btn = st.button("🗑️ 清除結果", use_container_width=True)
     rewrite_status_box = None
@@ -1135,12 +1261,18 @@ with tab_result:
         _pending_w  = _rt.count("⚠️")
         _new_items  = _rt.count("▸")
         _del_items  = _rt.count("✕")
+        st.markdown("#### AI 修改摘要")
         _dash1, _dash2, _dash3, _dash4, _dash5 = st.columns(5)
-        _dash1.metric("📝 原文字元", f"{len(_old_snap):,}" if _old_snap else "—")
-        _dash2.metric("✨ 改寫字元", f"{len(_rt):,}")
-        _dash3.metric("❓ 待確認項目", _pending_q)
-        _dash4.metric("⚠️ 建議評估", _pending_w)
-        _dash5.metric("▸ 新增 / ✕ 調整", f"{_new_items} / {_del_items}")
+        with _dash1:
+            render_summary_card("保留條文數", main_clause_count(_rt))
+        with _dash2:
+            render_summary_card("待確認項", _pending_q)
+        with _dash3:
+            render_summary_card("建議刪除/評估", _pending_w)
+        with _dash4:
+            render_summary_card("新增/調整", f"{_new_items} / {_del_items}")
+        with _dash5:
+            render_summary_card("精進文件", "已套用" if kb_text else "未套用")
         st.markdown("---")
 
     if run_btn:
@@ -1290,10 +1422,19 @@ with tab_result:
                 display_result = st.session_state.result_text
                 display_old    = st.session_state.get("current_old_text_snapshot", "")
         with ctrl2:
-            st.write("")
-            compare_mode = st.toggle("📊 新舊對照模式", key="compare_toggle")
+            mode_cols = st.columns(2)
+            with mode_cols[0]:
+                compare_mode = st.toggle("📊 新舊對照", key="compare_toggle")
+            with mode_cols[1]:
+                review_mode = st.toggle("🔎 審查模式", key="review_toggle")
 
-        if compare_mode:
+        if review_mode:
+            _review_parsed = parse_result_sections(display_result)
+            st.markdown("#### 🔎 審查模式")
+            st.caption("只顯示待確認項與風險條款，方便評審快速看到 AI 的判斷依據。")
+            review_section = next((c for t, c in _review_parsed.items() if t.startswith("二")), "")
+            render_review_lines(review_section)
+        elif compare_mode:
             _secs = display_result.split("===")
             _parsed_for_compare = {}
             for _i in range(1, len(_secs) - 1, 2):
@@ -1414,13 +1555,14 @@ with tab_result:
                 res_main, res_side = st.columns([3, 2], gap="large")
                 with res_main:
                     if main_title:
-                        st.markdown(f"#### {emoji_map.get('一','📄')} {main_title}")
+                        render_colored_section(main_title, parsed[main_title])
                         render_section(main_title, parsed[main_title])
                 with res_side:
                     st.markdown("#### 📑 摘要與待確認")
                     for title in other_titles:
                         emoji = emoji_map.get(title[0] if title else "", "📌")
                         with st.expander(f"{emoji} {title}", expanded=title.startswith("二")):
+                            render_colored_section(title, parsed[title])
                             render_section(title, parsed[title])
             else:
                 st.markdown(result_text)
