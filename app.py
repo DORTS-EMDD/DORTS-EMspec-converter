@@ -290,7 +290,9 @@ def build_toc_from_pdf_text(file_bytes, max_scan=25):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     raw_lines = []
-    for page_no in range(min(total, max_scan)):
+    toc_pages, _ = detect_toc_pages(file_bytes, max_scan=max_scan)
+    scan_pages = toc_pages if toc_pages else list(range(min(total, 8)))
+    for page_no in scan_pages:
         raw_lines.extend(doc[page_no].get_text("text").splitlines())
 
     toc_raw = []
@@ -335,6 +337,10 @@ def build_toc_from_pdf_text(file_bytes, max_scan=25):
         if pages_only[i] < pages_only[i - 1] - 1:
             anomalies.append(f"「{toc[i][1]}」頁碼({pages_only[i]}) 小於前一章節({pages_only[i-1]})")
             break
+    if page_map and coverage < 0.5:
+        anomalies.append(f"快速解析頁碼命中率偏低（{coverage:.0%}），建議改用 Gemini Vision。")
+    if not page_map:
+        anomalies.append("快速解析未找到可對照的印刷頁碼，建議改用 Gemini Vision。")
     needs_review = len(anomalies) > 0
     return toc, toc_raw, 0, total, page_map, coverage, needs_review, anomalies
 
@@ -672,6 +678,53 @@ tab_input, tab_result, tab_refine = st.tabs([
 import streamlit.components.v1 as _stc
 
 
+def _result_tab_script():
+    return """<script>
+    (function(){
+        const targetText = "② 改寫結果";
+        let attempts = 0;
+
+        function getDocs(){
+            const docs = [];
+            try { docs.push(window.parent.document); } catch(e) {}
+            try { docs.push(window.top.document); } catch(e) {}
+            try { docs.push(document); } catch(e) {}
+            return docs;
+        }
+
+        function activate(tab){
+            tab.scrollIntoView({block: "center", inline: "center"});
+            tab.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, cancelable: true, view: window}));
+            tab.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, cancelable: true, view: window}));
+            tab.click();
+        }
+
+        function trySwitch(){
+            attempts += 1;
+            for (const d of getDocs()){
+                const tabs = Array.from(d.querySelectorAll('[data-baseweb="tab"], button[role="tab"], [role="tab"]'));
+                const matched = tabs.find(t => (t.innerText || t.textContent || "").replace(/\\s+/g, " ").includes(targetText));
+                if (matched) {
+                    activate(matched);
+                    return;
+                }
+                if (tabs.length >= 2) {
+                    activate(tabs[1]);
+                    return;
+                }
+            }
+            if (attempts < 30) setTimeout(trySwitch, 200);
+        }
+
+        setTimeout(trySwitch, 50);
+    })();
+    </script>"""
+
+
+def emit_result_tab_switch():
+    _stc.html(_result_tab_script(), height=0)
+
+
 def switch_to_result_page(message="✅ 已切換至「② 改寫結果」", icon="🎉"):
     st.session_state["_switch_to_result"] = {"message": message, "icon": icon}
 
@@ -683,49 +736,7 @@ if _switch_payload:
         st.toast(_switch_payload.get("message", "✅ 已切換至「② 改寫結果」"), icon=_switch_payload.get("icon", "🎉"))
     else:
         st.toast("✅ 已切換至「② 改寫結果」", icon="🎉")
-    _stc.html(
-        """<script>
-        (function(){
-            const targetText = "② 改寫結果";
-            let attempts = 0;
-
-            function getDocs(){
-                const docs = [];
-                try { docs.push(window.parent.document); } catch(e) {}
-                try { docs.push(window.top.document); } catch(e) {}
-                try { docs.push(document); } catch(e) {}
-                return docs;
-            }
-
-            function activate(tab){
-                tab.scrollIntoView({block: "center", inline: "center"});
-                tab.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, cancelable: true, view: window}));
-                tab.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, cancelable: true, view: window}));
-                tab.click();
-            }
-
-            function trySwitch(){
-                attempts += 1;
-                for (const d of getDocs()){
-                    const tabs = Array.from(d.querySelectorAll('[data-baseweb="tab"], button[role="tab"], [role="tab"]'));
-                    const matched = tabs.find(t => (t.innerText || t.textContent || "").replace(/\\s+/g, " ").includes(targetText));
-                    if (matched) {
-                        activate(matched);
-                        return;
-                    }
-                    if (tabs.length >= 2) {
-                        activate(tabs[1]);
-                        return;
-                    }
-                }
-                if (attempts < 30) setTimeout(trySwitch, 200);
-            }
-
-            setTimeout(trySwitch, 100);
-        })();
-        </script>""",
-        height=0,
-    )
+    emit_result_tab_switch()
 
 # ══════════════════════════════════════════════════════════
 # ① 輸入分頁
@@ -756,17 +767,18 @@ with tab_input:
                     with st.spinner("📖 正在建立目錄與頁碼對照表，先使用快速文字解析…"):
                         (toc, toc_raw, detected_offset, total_pages,
                          page_map, coverage, needs_review, anomalies) = build_toc_from_pdf_text(pdf_bytes)
-                        if toc:
-                            st.success("✅ 已用 PDF 文字層快速建立目錄，無需等待 Gemini Vision")
-                        elif not api_key:
-                            st.error("⚠️ 快速解析未找到目錄；若要改用 Gemini Vision，請先在左側輸入 API Key。")
-                            toc, toc_raw, detected_offset, total_pages = [], [], 0, total_pages
-                            page_map, coverage, needs_review, anomalies = {}, 0.0, False, []
-                        else:
-                            st.info("ℹ️ 快速解析未找到完整目錄，改用 Gemini Vision 辨識。")
+                        use_vision = (not toc) or needs_review
+                        if use_vision and api_key:
+                            st.info("ℹ️ 快速解析信心不足，改用 Gemini Vision 重新辨識目錄。")
                             (toc, toc_raw, detected_offset, total_pages,
                              page_map, coverage, needs_review, anomalies) = build_toc_via_vision(
                                 api_key, selected_model, pdf_bytes)
+                        elif toc:
+                            st.success("✅ 已用 PDF 文字層快速建立目錄")
+                        else:
+                            st.error("⚠️ 快速解析未找到目錄；若要改用 Gemini Vision，請先在左側輸入 API Key。")
+                            toc, toc_raw, detected_offset, total_pages = [], [], 0, total_pages
+                            page_map, coverage, needs_review, anomalies = {}, 0.0, False, []
                         st.session_state.cf620_total_pages     = total_pages
                         st.session_state.cf620_toc             = toc
                         st.session_state.cf620_toc_raw         = toc_raw
@@ -785,6 +797,24 @@ with tab_input:
                     coverage        = st.session_state.get("cf620_coverage", 0.0)
                     needs_review    = st.session_state.get("cf620_needs_review", False)
                     anomalies       = st.session_state.get("cf620_anomalies", [])
+
+                if st.button("🔁 使用 Gemini Vision 重新辨識目錄", disabled=not api_key, use_container_width=True):
+                    if not api_key:
+                        st.error("⚠️ 請先在左側輸入 API Key。")
+                    else:
+                        with st.spinner("📖 使用 Gemini Vision 重新辨識目錄中…"):
+                            (toc, toc_raw, detected_offset, total_pages,
+                             page_map, coverage, needs_review, anomalies) = build_toc_via_vision(
+                                api_key, selected_model, pdf_bytes)
+                            st.session_state.cf620_total_pages     = total_pages
+                            st.session_state.cf620_toc             = toc
+                            st.session_state.cf620_toc_raw         = toc_raw
+                            st.session_state.cf620_detected_offset = detected_offset
+                            st.session_state.cf620_page_map        = page_map
+                            st.session_state.cf620_coverage        = coverage
+                            st.session_state.cf620_needs_review    = needs_review
+                            st.session_state.cf620_anomalies       = anomalies
+                            st.success("✅ Gemini Vision 目錄重新辨識完成")
 
                 # ── 載入摘要 + 頁碼信心度 ──
                 c1, c2, c3 = st.columns(3)
@@ -1016,8 +1046,12 @@ with tab_input:
     rewrite_status_box = None
     rewrite_progress_bar = None
     if run_btn:
-        rewrite_status_box = st.empty()
-        rewrite_progress_bar = st.progress(0, text="⏳ AI 改寫準備中，請稍候…")
+        _can_start_rewrite = bool(api_key and old_text and old_text.strip())
+        if _can_start_rewrite:
+            emit_result_tab_switch()
+        else:
+            rewrite_status_box = st.empty()
+            rewrite_progress_bar = st.progress(0, text="⏳ AI 改寫準備中，請稍候…")
 
 # ══════════════════════════════════════════════════════════
 # ② 改寫結果分頁
@@ -1474,6 +1508,5 @@ with tab_refine:
                 if not success and retries == 0:
                     st.error("❌ 已超過重試次數，請稍後手動重試。")
                 if success:
-                    st.toast("✅ 精修完成！歷史版本已更新", icon="🔄")
-                    st.success("✅ 精修完成！請至「② 改寫結果」查看更新後內容。")
+                    switch_to_result_page("✅ 精修完成！已切換至「② 改寫結果」查看更新後內容。", "🔄")
                     st.rerun()
