@@ -616,16 +616,32 @@ tab_input, tab_result, tab_refine, tab_history = st.tabs([
     "　④ 歷史版本　",
 ])
 
-# ── 改寫完成後自動跳至 ② 分頁（rerun 後在此觸發，DOM 已就緒）──
+import streamlit.components.v1 as _stc
+
+# ── 改寫完成後自動跳至 ② 分頁（用 components.html 才能真正執行 JS）──
 if st.session_state.pop("_switch_to_result", False):
-    st.markdown(
+    st.toast("✅ AI 改寫完成！請切換至「② 改寫結果」查看", icon="🎉")
+    _stc.html(
         """<script>
-        setTimeout(function(){
-            var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
-            if(tabs && tabs.length >= 2){ tabs[1].click(); }
-        }, 400);
+        (function(){
+            var attempts = 0;
+            function trySwitch(){
+                attempts++;
+                var docs = [];
+                try{ docs.push(window.parent.document); } catch(e){}
+                try{ docs.push(document); } catch(e){}
+                for(var d of docs){
+                    var tabs = d.querySelectorAll('[data-baseweb="tab"]');
+                    if(tabs && tabs.length >= 2){ tabs[1].click(); return; }
+                    tabs = d.querySelectorAll('button[role="tab"]');
+                    if(tabs && tabs.length >= 2){ tabs[1].click(); return; }
+                }
+                if(attempts < 8) setTimeout(trySwitch, 300);
+            }
+            setTimeout(trySwitch, 300);
+        })();
         </script>""",
-        unsafe_allow_html=True,
+        height=0,
     )
 
 # ══════════════════════════════════════════════════════════
@@ -1351,6 +1367,7 @@ with tab_refine:
                 if not success and retries == 0:
                     st.error("❌ 已超過重試次數，請稍後手動重試。")
                 if success:
+                    st.toast("✅ 精修完成！歷史版本已更新", icon="🔄")
                     st.success("✅ 精修完成！請至「② 改寫結果」查看更新後內容。")
                     st.rerun()
 
@@ -1358,16 +1375,19 @@ with tab_refine:
 # ④ 歷史版本分頁
 # ══════════════════════════════════════════════════════════
 with tab_history:
-    st.subheader("📚 改寫歷史版本")
+    _hcount = len(st.session_state.rewrite_history)
+    st.subheader(f"📚 改寫歷史版本（共 {_hcount} 版）")
     history = st.session_state.rewrite_history
     if not history:
         st.info("尚無歷史紀錄。完成一次改寫或精修後，版本將自動儲存於此。")
     else:
         st.caption(f"共 {len(history)} 個版本（最多保留 10 個，最新在最上方）")
         for i, h in enumerate(history):
+            _exp_key = f"hexp_{h['ts'].replace('/','-').replace(':','')}_{i}"
             with st.expander(
                 f"{'🔵' if i == 0 else '⚪'} 第 {i+1} 版　{h['ts']}　｜　{h['label']}",
                 expanded=(i == 0),
+                key=_exp_key,
             ):
                 # 摘要數據
                 _hq = h['text'].count("❓")
