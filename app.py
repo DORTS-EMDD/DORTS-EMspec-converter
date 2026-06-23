@@ -618,27 +618,57 @@ tab_input, tab_result, tab_refine, tab_history = st.tabs([
 
 import streamlit.components.v1 as _stc
 
-# ── 改寫完成後自動跳至 ② 分頁（用 components.html 才能真正執行 JS）──
-if st.session_state.pop("_switch_to_result", False):
-    st.toast("✅ AI 改寫完成！請切換至「② 改寫結果」查看", icon="🎉")
+
+def switch_to_result_page(message="✅ 已切換至「② 改寫結果」", icon="🎉"):
+    st.session_state["_switch_to_result"] = {"message": message, "icon": icon}
+
+
+# ── 改寫/還原完成後自動跳至 ② 分頁（st.tabs 無原生 API，故用前端點擊）──
+_switch_payload = st.session_state.pop("_switch_to_result", None)
+if _switch_payload:
+    if isinstance(_switch_payload, dict):
+        st.toast(_switch_payload.get("message", "✅ 已切換至「② 改寫結果」"), icon=_switch_payload.get("icon", "🎉"))
+    else:
+        st.toast("✅ 已切換至「② 改寫結果」", icon="🎉")
     _stc.html(
         """<script>
         (function(){
-            var attempts = 0;
-            function trySwitch(){
-                attempts++;
-                var docs = [];
-                try{ docs.push(window.parent.document); } catch(e){}
-                try{ docs.push(document); } catch(e){}
-                for(var d of docs){
-                    var tabs = d.querySelectorAll('[data-baseweb="tab"]');
-                    if(tabs && tabs.length >= 2){ tabs[1].click(); return; }
-                    tabs = d.querySelectorAll('button[role="tab"]');
-                    if(tabs && tabs.length >= 2){ tabs[1].click(); return; }
-                }
-                if(attempts < 8) setTimeout(trySwitch, 300);
+            const targetText = "② 改寫結果";
+            let attempts = 0;
+
+            function getDocs(){
+                const docs = [];
+                try { docs.push(window.parent.document); } catch(e) {}
+                try { docs.push(window.top.document); } catch(e) {}
+                try { docs.push(document); } catch(e) {}
+                return docs;
             }
-            setTimeout(trySwitch, 300);
+
+            function activate(tab){
+                tab.scrollIntoView({block: "center", inline: "center"});
+                tab.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, cancelable: true, view: window}));
+                tab.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, cancelable: true, view: window}));
+                tab.click();
+            }
+
+            function trySwitch(){
+                attempts += 1;
+                for (const d of getDocs()){
+                    const tabs = Array.from(d.querySelectorAll('[data-baseweb="tab"], button[role="tab"], [role="tab"]'));
+                    const matched = tabs.find(t => (t.innerText || t.textContent || "").replace(/\\s+/g, " ").includes(targetText));
+                    if (matched) {
+                        activate(matched);
+                        return;
+                    }
+                    if (tabs.length >= 2) {
+                        activate(tabs[1]);
+                        return;
+                    }
+                }
+                if (attempts < 30) setTimeout(trySwitch, 200);
+            }
+
+            setTimeout(trySwitch, 100);
         })();
         </script>""",
         height=0,
@@ -1085,7 +1115,7 @@ with tab_result:
                 st.error("❌ 已超過重試次數，請稍後手動重試。")
             st.session_state.running = False
             if success:
-                st.session_state["_switch_to_result"] = True
+                switch_to_result_page("✅ AI 改寫完成！已切換至「② 改寫結果」查看", "🎉")
             st.rerun()
 
     if st.session_state.result_text:
@@ -1417,18 +1447,20 @@ with tab_history:
                 with btn_col1:
                     if st.button("♻️ 還原為此版本", key=f"restore_{i}", use_container_width=True, type="primary"):
                         _tw_now3 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                        st.session_state.rewrite_history.insert(0, {
+                        _restored_entry = {
                             "ts":       _tw_now3.strftime("%m/%d %H:%M"),
                             "label":    f"{h['label']}（還原）",
                             "text":     h['text'],
                             "old_text": h.get("old_text", ""),
-                        })
-                        st.session_state.rewrite_history = st.session_state.rewrite_history[:10]
+                        }
+                        st.session_state.rewrite_history = (
+                            [_restored_entry] + list(st.session_state.rewrite_history)
+                        )[:10]
                         st.session_state.result_text = h['text']
                         st.session_state.current_old_text_snapshot = h.get("old_text", "")
                         # 清除歷史選單 key，讓 ② 分頁自動顯示剛還原的最新版
                         st.session_state.pop("history_select", None)
-                        st.success(f"✅ 已還原至「{h['label']}」版本，請至「② 改寫結果」查看")
+                        switch_to_result_page(f"✅ 已還原至「{h['label']}」版本，並切換至「② 改寫結果」", "♻️")
                         st.rerun()
                 with btn_col2:
                     st.download_button(
