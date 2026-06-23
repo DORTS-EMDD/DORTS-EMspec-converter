@@ -44,13 +44,23 @@ def set_running():
 def detect_toc_pages(file_bytes, max_scan=20):
     """偵測前 max_scan 頁中目錄頁（章節編號密度高的頁面），回傳 page_no list（0-based）"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    toc_pat = re.compile(r"^\d{1,2}(?:\.\d{1,3}){1,4}")
-    toc_pages = []
+    toc_pat = re.compile(r"\b\d{1,2}(?:\.\d{1,3}){0,5}\s+.{1,80}?\.{3,}\s*\d{1,4}\b")
+    page_scores = []
     for page_no in range(min(len(doc), max_scan)):
-        lines = doc[page_no].get_text("text").splitlines()
-        hits = sum(1 for ln in lines if toc_pat.match(ln.strip()))
-        if hits >= 5:
-            toc_pages.append(page_no)
+        text = doc[page_no].get_text("text")
+        compact = re.sub(r"\s+", " ", text)
+        hits = len(toc_pat.findall(compact))
+        has_toc_title = ("目錄" in compact) or ("目 錄" in compact) or ("目  錄" in compact)
+        page_scores.append((page_no, hits, has_toc_title))
+
+    strong_pages = {p for p, hits, has_toc_title in page_scores if hits >= 5 or (has_toc_title and hits >= 1)}
+    toc_pages = set(strong_pages)
+    if strong_pages:
+        first, last = min(strong_pages), max(strong_pages)
+        for p, hits, has_toc_title in page_scores:
+            if first - 1 <= p <= last + 1 and hits >= 2:
+                toc_pages.add(p)
+    toc_pages = sorted(toc_pages)
     return toc_pages, len(doc)
 
 
@@ -65,7 +75,7 @@ def render_page_to_png(file_bytes, page_no, dpi=150):
 
 
 @st.cache_data(show_spinner=False)
-def build_printed_page_map(file_bytes):
+def build_printed_page_map(file_bytes, skip_through_page_idx=-1):
     """
     【方案 A 核心】掃過全部頁面，從頁眉/頁尾抓「實際印刷頁碼」，
     建立 {印刷頁碼: pdf_index(0-based)} 對照表。
@@ -85,6 +95,8 @@ def build_printed_page_map(file_bytes):
 
     page_map = {}
     for idx in range(len(doc)):
+        if idx <= skip_through_page_idx:
+            continue
         text = doc[idx].get_text("text")
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         if not lines:
@@ -179,15 +191,15 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
     回傳 (toc, total_pages)
       toc = [[level, "X.X.X 標題", absolute_pdf_page], ...]
     """
-    toc_page_nos, total = detect_toc_pages(file_bytes, max_scan=30)
+    detected_toc_page_nos, total = detect_toc_pages(file_bytes, max_scan=30)
 
     # 目錄常跨多頁；自動補前後相鄰頁，避免只辨識到中間頁而漏掉首頁/尾頁。
-    if not toc_page_nos:
-        toc_page_nos = list(range(min(8, total)))
+    if not detected_toc_page_nos:
+        toc_page_nos = list(range(min(10, total)))
     else:
-        start_page = max(0, min(toc_page_nos) - 1)
-        end_page = min(total - 1, max(toc_page_nos) + 1)
-        toc_page_nos = list(range(start_page, end_page + 1))[:8]
+        start_page = max(0, min(detected_toc_page_nos) - 1)
+        end_page = min(total - 1, max(detected_toc_page_nos) + 1)
+        toc_page_nos = list(range(start_page, end_page + 1))[:12]
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
@@ -242,7 +254,8 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
     # ══════════════════════════════════════════════════════
     # 【方案 A】邏輯頁碼 → 絕對 PDF 頁碼：查表（治本），不再用單一 offset
     # ══════════════════════════════════════════════════════
-    page_map = build_printed_page_map(file_bytes)
+    toc_last_page_idx = max(detected_toc_page_nos) if detected_toc_page_nos else max(toc_page_nos) if toc_page_nos else -1
+    page_map = build_printed_page_map(file_bytes, skip_through_page_idx=toc_last_page_idx)
     to_abs   = make_to_abs(page_map)
 
     if page_map:
@@ -323,7 +336,8 @@ def build_toc_from_pdf_text(file_bytes, max_scan=25):
     if len(toc_raw) < 3:
         return [], [], 0, total, {}, 0.0, True, ["文字層未解析到足夠目錄項目，建議改用 Gemini Vision。"]
 
-    page_map = build_printed_page_map(file_bytes)
+    toc_last_page_idx = max(toc_pages) if toc_pages else -1
+    page_map = build_printed_page_map(file_bytes, skip_through_page_idx=toc_last_page_idx)
     if page_map:
         to_abs = make_to_abs(page_map)
         toc = [[lv, title, max(1, min(to_abs(logical_p), total))]
@@ -810,7 +824,7 @@ with tab_input:
                     pdf_bytes = cf620_pdf.read()
                     st.session_state.pdf_bytes_cache = pdf_bytes
                     st.session_state.cf620_pdf_name = cf620_pdf.name
-                    with st.spinner("📖 使用 Gemini Vision 辨識目錄並建立頁碼對照表（最多 8 頁），請稍候…"):
+                    with st.spinner("📖 使用 Gemini Vision 辨識目錄並建立頁碼對照表（最多 12 頁），請稍候…"):
                         if not api_key:
                             st.error("⚠️ 請先在左側輸入 API Key 才能辨識目錄！")
                             toc, toc_raw, detected_offset, total_pages = [], [], 0, 1
@@ -842,7 +856,7 @@ with tab_input:
                     if not api_key:
                         st.error("⚠️ 請先在左側輸入 API Key。")
                     else:
-                        with st.spinner("📖 使用 Gemini Vision 重新辨識目錄中（最多 8 頁）…"):
+                        with st.spinner("📖 使用 Gemini Vision 重新辨識目錄中（最多 12 頁）…"):
                             (toc, toc_raw, detected_offset, total_pages,
                              page_map, coverage, needs_review, anomalies) = build_toc_via_vision(
                                 api_key, selected_model, pdf_bytes)
@@ -1495,6 +1509,7 @@ with tab_refine:
 - 一、改寫後條文 區塊內容必須乾淨，不得出現〔待確認〕、【建議刪除】等標記
 """
                 st.session_state["_pending_refine_prompt"] = refine_prompt
+                st.session_state.running = False
                 switch_to_result_page("⏳ 已切換至「② 改寫結果」執行二次精修。", "🔄")
                 st.rerun()
 
