@@ -179,20 +179,22 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
     回傳 (toc, total_pages)
       toc = [[level, "X.X.X 標題", absolute_pdf_page], ...]
     """
-    toc_page_nos, total = detect_toc_pages(file_bytes)
+    toc_page_nos, total = detect_toc_pages(file_bytes, max_scan=30)
 
-    # fallback：找不到目錄頁就掃前 3 頁；最多送 4 頁給 Vision，降低等待時間。
+    # 目錄常跨多頁；自動補前後相鄰頁，避免只辨識到中間頁而漏掉首頁/尾頁。
     if not toc_page_nos:
-        toc_page_nos = list(range(min(3, total)))
+        toc_page_nos = list(range(min(8, total)))
     else:
-        toc_page_nos = toc_page_nos[:4]
+        start_page = max(0, min(toc_page_nos) - 1)
+        end_page = min(total - 1, max(toc_page_nos) + 1)
+        toc_page_nos = list(range(start_page, end_page + 1))[:8]
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
 
     raw_lines = []
     for page_no in toc_page_nos:
-        png_bytes = render_page_to_png(file_bytes, page_no, dpi=110)
+        png_bytes = render_page_to_png(file_bytes, page_no, dpi=120)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
         prompt_parts = [
             {"inline_data": {"mime_type": "image/png", "data": b64}},
@@ -808,7 +810,7 @@ with tab_input:
                     pdf_bytes = cf620_pdf.read()
                     st.session_state.pdf_bytes_cache = pdf_bytes
                     st.session_state.cf620_pdf_name = cf620_pdf.name
-                    with st.spinner("📖 使用 Gemini Vision 辨識目錄並建立頁碼對照表，請稍候…"):
+                    with st.spinner("📖 使用 Gemini Vision 辨識目錄並建立頁碼對照表（最多 8 頁），請稍候…"):
                         if not api_key:
                             st.error("⚠️ 請先在左側輸入 API Key 才能辨識目錄！")
                             toc, toc_raw, detected_offset, total_pages = [], [], 0, 1
@@ -840,7 +842,7 @@ with tab_input:
                     if not api_key:
                         st.error("⚠️ 請先在左側輸入 API Key。")
                     else:
-                        with st.spinner("📖 使用 Gemini Vision 重新辨識目錄中…"):
+                        with st.spinner("📖 使用 Gemini Vision 重新辨識目錄中（最多 8 頁）…"):
                             (toc, toc_raw, detected_offset, total_pages,
                              page_map, coverage, needs_review, anomalies) = build_toc_via_vision(
                                 api_key, selected_model, pdf_bytes)
