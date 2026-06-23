@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import google.generativeai as genai
 import fitz          # PyMuPDF
 import docx
@@ -181,16 +181,18 @@ def build_toc_via_vision(api_key, model_name, file_bytes):
     """
     toc_page_nos, total = detect_toc_pages(file_bytes)
 
-    # fallback：找不到目錄頁就掃前 5 頁
+    # fallback：找不到目錄頁就掃前 3 頁；最多送 4 頁給 Vision，降低等待時間。
     if not toc_page_nos:
-        toc_page_nos = list(range(min(5, total)))
+        toc_page_nos = list(range(min(3, total)))
+    else:
+        toc_page_nos = toc_page_nos[:4]
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
 
     raw_lines = []
     for page_no in toc_page_nos:
-        png_bytes = render_page_to_png(file_bytes, page_no)
+        png_bytes = render_page_to_png(file_bytes, page_no, dpi=110)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
         prompt_parts = [
             {"inline_data": {"mime_type": "image/png", "data": b64}},
@@ -347,7 +349,7 @@ def build_toc_from_pdf_text(file_bytes, max_scan=25):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(file_bytes, page_start, page_end):
-    """萃取指定頁碼範圍（1-based），保留表格結構，過濾頁首頁尾"""
+    """擷取指定頁碼範圍（1-based），保留表格結構，過濾頁首頁尾"""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     p0 = max(0, page_start - 1)
@@ -397,7 +399,7 @@ def extract_pages(file_bytes, page_start, page_end):
 
 def trim_to_chapter(text, chapter_id, next_chapter_id=None):
     """
-    從萃取的多頁文字中，精確裁切出目標章節的內容：
+    從擷取的多頁文字中，精確裁切出目標章節的內容：
     - 往前裁：找到 chapter_id 開頭的那一行，丟棄之前的內容
     - 往後裁：找到 next_chapter_id 開頭的那一行，丟棄之後的內容
     chapter_id 例如 "2.1.12"，允許後面接空格或中文
@@ -596,7 +598,7 @@ st.markdown(
 )
 
 st.title("🚆 未來線中運量機電特別技術規範 - 智慧改寫平台")
-st.caption("運用 Gemini AI，將既有 PTS 條文改寫為未來線中運量系統版本 ｜ 三步驟：輸入 → 改寫 → 精修")
+st.caption("運用 Gemini AI，將既有特別技術規範改寫為未來線中運量系統版本 ｜ 三步驟：輸入 → 改寫 → 精修")
 
 # ══════════════════════════════════════════════════════════
 # 左側欄：只保留「系統設定 + 精進文件」，提示語移至主畫面
@@ -629,7 +631,7 @@ with st.sidebar:
         accept_multiple_files=True, type=["pdf", "docx"], key="kb_uploader",
     )
 
-# ── 精進文件萃取（邏輯不變，只是搬到 sidebar 區塊外處理） ──
+# ── 精進文件擷取（邏輯不變，只是搬到 sidebar 區塊外處理） ──
 kb_text = ""
 if uploaded_files:
     kb_cache_key = tuple((f.name, f.size) for f in uploaded_files)
@@ -656,15 +658,15 @@ with st.sidebar:
         st.caption(f"📑 目前精進文件約 {len(kb_text):,} 字")
 
     st.markdown("---")
-    st.header("🔒 術語保護清單（選填）")
-    st.caption("每行一個專業術語，AI 改寫時將原文照錄，不得更動")
-    protected_terms_input = st.text_area(
-        "受保護術語",
-        height=120,
-        placeholder="例如：\n750V DC\nCBTC\nATO自動駕駛\nGoA4",
-        label_visibility="collapsed",
-        key="protected_terms_area",
-    )
+    with st.expander("🔒 術語保護清單（選填）", expanded=False):
+        st.caption("每行一個專業術語，AI 改寫時將原文照錄，不得更動")
+        protected_terms_input = st.text_area(
+            "受保護術語",
+            height=120,
+            placeholder="例如：\n750V DC\nCBTC\nATO自動駕駛\nGoA4",
+            label_visibility="collapsed",
+            key="protected_terms_area",
+        )
 
 # ══════════════════════════════════════════════════════════
 # 主流程：三個分頁（① 輸入 → ② 改寫結果 → ③ 精修）
@@ -729,6 +731,48 @@ def switch_to_result_page(message="✅ 已切換至「② 改寫結果」", icon
     st.session_state["_switch_to_result"] = {"message": message, "icon": icon}
 
 
+def generate_with_progress(prompt, model_name, api_key, progress_bar, progress_label):
+    retries, success, full_text = 3, False, ""
+    while not success and retries > 0:
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt, stream=True)
+            full_text = ""
+            chunk_count = 0
+            progress_bar.progress(0.05, text=f"⏳ {progress_label}中，正在等待 AI 回應…")
+            for chunk in response:
+                try:
+                    full_text += chunk.text
+                    chunk_count += 1
+                    if chunk_count % 6 == 0:
+                        progress_bar.progress(
+                            min(chunk_count / 80, 0.95),
+                            text=f"⏳ {progress_label}中… 已產出 {len(full_text):,} 字元"
+                        )
+                except Exception:
+                    pass
+            progress_bar.progress(1.0, text=f"✅ {progress_label}完成！")
+            full_text = re.sub(r'\n{3,}', '\n\n', full_text)
+            success = True
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                retries -= 1
+                if retries > 0:
+                    st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
+                    time.sleep(15)
+            elif "API_KEY_INVALID" in err or "api key" in err.lower():
+                st.error("❌ API Key 無效。")
+                break
+            else:
+                st.error(f"❌ 錯誤：{err}")
+                break
+    if not success and retries == 0:
+        st.error("❌ 已超過重試次數，請稍後手動重試。")
+    return success, full_text
+
+
 # ── 改寫/還原完成後自動跳至 ② 分頁（st.tabs 無原生 API，故用前端點擊）──
 _switch_payload = st.session_state.pop("_switch_to_result", None)
 if _switch_payload:
@@ -754,7 +798,7 @@ with tab_input:
         # ── 來源 1：大型 PDF 選頁 ──────────────────────────
         with src_pdf:
             st.markdown(
-                '<div class="pts-hint">💡 流程：上傳 PDF → 自動辨識目錄 → 選章節 → 萃取內容</div>',
+                '<div class="pts-hint">💡 流程：上傳 PDF → 自動辨識目錄 → 選章節 → 擷取內容</div>',
                 unsafe_allow_html=True,
             )
             cf620_pdf = st.file_uploader("上傳 PTS 完整 PDF", type=["pdf"], key="cf620_big_pdf")
@@ -764,21 +808,15 @@ with tab_input:
                     pdf_bytes = cf620_pdf.read()
                     st.session_state.pdf_bytes_cache = pdf_bytes
                     st.session_state.cf620_pdf_name = cf620_pdf.name
-                    with st.spinner("📖 正在建立目錄與頁碼對照表，先使用快速文字解析…"):
-                        (toc, toc_raw, detected_offset, total_pages,
-                         page_map, coverage, needs_review, anomalies) = build_toc_from_pdf_text(pdf_bytes)
-                        use_vision = (not toc) or needs_review
-                        if use_vision and api_key:
-                            st.info("ℹ️ 快速解析信心不足，改用 Gemini Vision 重新辨識目錄。")
+                    with st.spinner("📖 使用 Gemini Vision 辨識目錄並建立頁碼對照表，請稍候…"):
+                        if not api_key:
+                            st.error("⚠️ 請先在左側輸入 API Key 才能辨識目錄！")
+                            toc, toc_raw, detected_offset, total_pages = [], [], 0, 1
+                            page_map, coverage, needs_review, anomalies = {}, 0.0, False, []
+                        else:
                             (toc, toc_raw, detected_offset, total_pages,
                              page_map, coverage, needs_review, anomalies) = build_toc_via_vision(
                                 api_key, selected_model, pdf_bytes)
-                        elif toc:
-                            st.success("✅ 已用 PDF 文字層快速建立目錄")
-                        else:
-                            st.error("⚠️ 快速解析未找到目錄；若要改用 Gemini Vision，請先在左側輸入 API Key。")
-                            toc, toc_raw, detected_offset, total_pages = [], [], 0, total_pages
-                            page_map, coverage, needs_review, anomalies = {}, 0.0, False, []
                         st.session_state.cf620_total_pages     = total_pages
                         st.session_state.cf620_toc             = toc
                         st.session_state.cf620_toc_raw         = toc_raw
@@ -932,9 +970,9 @@ with tab_input:
                 # ── 頁碼範圍提示 + 手動微調 ──
                 page_count_preview = min(auto_end, total_pages) - auto_start + 1
                 if page_count_preview > 30:
-                    st.warning(f"⚠️ 預計萃取 {page_count_preview} 頁，建議不超過 30 頁。")
+                    st.warning(f"⚠️ 預計擷取 {page_count_preview} 頁，建議不超過 30 頁。")
                 else:
-                    st.success(f"✅ 即將萃取第 {auto_start} ～ {min(auto_end, total_pages)} 頁（共 {page_count_preview} 頁）")
+                    st.success(f"✅ 即將擷取第 {auto_start} ～ {min(auto_end, total_pages)} 頁（共 {page_count_preview} 頁）")
 
                 page_start = max(1, min(auto_start, total_pages)) if total_pages > 0 else 1
                 page_end   = max(1, min(auto_end,   total_pages)) if total_pages > 0 else 1
@@ -950,8 +988,8 @@ with tab_input:
                     if page_end - page_start + 1 > 30:
                         st.warning(f"⚠️ 選取 {page_end - page_start + 1} 頁，建議不超過 30 頁。")
 
-                if st.button("📥 萃取選定頁面內容", use_container_width=True, type="primary"):
-                    with st.spinner(f"萃取第 {page_start}～{page_end} 頁..."):
+                if st.button("📥 擷取選定頁面內容", use_container_width=True, type="primary"):
+                    with st.spinner(f"擷取第 {page_start}～{page_end} 頁..."):
                         try:
                             extracted, _ = extract_pages(pdf_bytes, page_start, page_end)
                             ch_id   = st.session_state.get("chapter_id", "")
@@ -959,11 +997,11 @@ with tab_input:
                             if ch_id:
                                 extracted = trim_to_chapter(extracted, ch_id, next_id or None)
                             st.session_state.extracted_old_text = extracted
-                            st.success(f"✅ 萃取完成！共 {len(extracted)} 字元，可前往「② 改寫結果」執行改寫")
-                            with st.expander("預覽萃取內容", expanded=False):
+                            st.success(f"✅ 擷取完成！共 {len(extracted)} 字元，可前往「② 改寫結果」執行改寫")
+                            with st.expander("預覽擷取內容", expanded=False):
                                 st.text(extracted[:3000] + ("..." if len(extracted) > 3000 else ""))
                         except Exception as e:
-                            st.error(f"❌ 萃取失敗：{e}")
+                            st.error(f"❌ 擷取失敗：{e}")
 
         # ── 來源 2：手動貼上 ──
         with src_paste:
@@ -1026,9 +1064,9 @@ with tab_input:
         # 來源整合狀態
         st.markdown("##### 📌 目前輸入狀態")
         if st.session_state.extracted_old_text:
-            st.success(f"已就緒：PDF / 圖片萃取結果（{len(st.session_state.extracted_old_text)} 字元）")
+            st.success(f"已就緒：PDF / 圖片擷取結果（{len(st.session_state.extracted_old_text)} 字元）")
         else:
-            st.info("尚未萃取內容；若用「直接貼上」則於貼上後即可改寫")
+            st.info("尚未擷取內容；若用「直接貼上」則於貼上後即可改寫")
 
     # 整合輸入來源
     if st.session_state.extracted_old_text:
@@ -1045,9 +1083,9 @@ with tab_input:
         clear_btn = st.button("🗑️ 清除結果", use_container_width=True)
     rewrite_status_box = None
     rewrite_progress_bar = None
+    _rewrite_can_start = bool(run_btn and api_key and old_text and old_text.strip())
     if run_btn:
-        _can_start_rewrite = bool(api_key and old_text and old_text.strip())
-        if _can_start_rewrite:
+        if _rewrite_can_start:
             emit_result_tab_switch()
         else:
             rewrite_status_box = st.empty()
@@ -1058,6 +1096,13 @@ with tab_input:
 # ══════════════════════════════════════════════════════════
 with tab_result:
     st.subheader("✨ 智慧改寫草稿")
+    _pending_refine_prompt = st.session_state.get("_pending_refine_prompt")
+    _result_task_active = _rewrite_can_start or bool(_pending_refine_prompt)
+    result_progress_bar = None
+    if _result_task_active:
+        task_label = "二次精修" if _pending_refine_prompt else "AI 改寫"
+        result_progress_bar = st.progress(0, text=f"⏳ {task_label}準備中，請稍候…")
+        st.caption("任務完成後會在此頁顯示最新結果。")
 
     if clear_btn:
         st.session_state.result_text = ""
@@ -1066,7 +1111,7 @@ with tab_result:
         st.session_state.current_old_text_snapshot = ""
         st.rerun()
 
-    if st.session_state.result_text:
+    if st.session_state.result_text and not _result_task_active:
         # ── 修改摘要儀表板 ──────────────────────────────────
         _rt = st.session_state.result_text
         _old_snap = st.session_state.get("current_old_text_snapshot", "")
@@ -1094,7 +1139,7 @@ with tab_result:
             if rewrite_progress_bar:
                 rewrite_progress_bar.empty()
             if st.session_state.pdf_bytes_cache:
-                _msg = "⚠️ 請先到「① 輸入」分頁點擊「📥 萃取選定頁面內容」，再執行改寫！"
+                _msg = "⚠️ 請先到「① 輸入」分頁點擊「📥 擷取選定頁面內容」，再執行改寫！"
             else:
                 _msg = "⚠️ 請先於「① 輸入」分頁提供待改寫條文。"
             if rewrite_status_box:
@@ -1166,70 +1211,55 @@ with tab_result:
 === 五、專業意見與注意事項 ===
 （每項以「💡」開頭，各項間空一行）
 """
-            stream_box = rewrite_status_box if rewrite_status_box is not None else st.empty()
-            progress_bar = rewrite_progress_bar if rewrite_progress_bar is not None else st.progress(0, text="⏳ AI 改寫中，請稍候…")
-            progress_bar.progress(0.05, text="⏳ 已送出改寫任務，正在等待 AI 回應…")
-            retries, success, full_text = 3, False, ""
-            while not success and retries > 0:
-                try:
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel(selected_model)
-                    response = model.generate_content(prompt, stream=True)
-                    full_text = ""
-                    chunk_count = 0
-                    for chunk in response:
-                        try:
-                            full_text += chunk.text
-                            chunk_count += 1
-                            # 每 6 個 chunk 才更新一次 UI，避免 DOM 頻繁重繪拖慢速度
-                            if chunk_count % 6 == 0:
-                                progress_bar.progress(
-                                    min(chunk_count / 80, 0.95),
-                                    text=f"⏳ AI 改寫中… 已產出 {len(full_text):,} 字元"
-                                )
-                                stream_box.markdown(full_text + " ▌")
-                        except Exception:
-                            pass
-                    progress_bar.progress(1.0, text="✅ 改寫完成！")
-                    stream_box.empty()
-                    # 清理多餘空行（超過兩個換行壓縮為兩個）
-                    full_text = re.sub(r'\n{3,}', '\n\n', full_text)
-                    st.session_state.result_text = full_text
-                    chapter_label = st.session_state.get("chapter_id") or "手動輸入"
-                    _tw_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                    _new_entry = {
-                        "ts":       _tw_now.strftime("%m/%d %H:%M"),
-                        "label":    chapter_label,
-                        "text":     full_text,
-                        "old_text": old_text,
-                    }
-                    # 重新賦值（非 in-place insert），確保 Streamlit session_state 偵測到變更
-                    st.session_state.rewrite_history = (
-                        [_new_entry] + list(st.session_state.rewrite_history)
-                    )[:10]
-                    st.session_state.current_old_text_snapshot = old_text
-                    # 清除歷史選單 session state，確保下次顯示最新版
-                    st.session_state.pop("history_select", None)
-                    success = True
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "quota" in err.lower():
-                        retries -= 1
-                        if retries > 0:
-                            st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
-                            time.sleep(15)
-                    elif "API_KEY_INVALID" in err or "api key" in err.lower():
-                        st.error("❌ API Key 無效。"); break
-                    else:
-                        st.error(f"❌ 錯誤：{err}"); break
-            if not success and retries == 0:
-                st.error("❌ 已超過重試次數，請稍後手動重試。")
+            progress_bar = result_progress_bar or rewrite_progress_bar or st.progress(0, text="⏳ AI 改寫中，請稍候…")
+            success, full_text = generate_with_progress(prompt, selected_model, api_key, progress_bar, "AI 改寫")
+            if success:
+                st.session_state.result_text = full_text
+                chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+                _tw_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+                _new_entry = {
+                    "ts":       _tw_now.strftime("%m/%d %H:%M"),
+                    "label":    chapter_label,
+                    "text":     full_text,
+                    "old_text": old_text,
+                }
+                # 重新賦值（非 in-place insert），確保 Streamlit session_state 偵測到變更
+                st.session_state.rewrite_history = (
+                    [_new_entry] + list(st.session_state.rewrite_history)
+                )[:10]
+                st.session_state.current_old_text_snapshot = old_text
+                # 清除歷史選單 session state，確保下次顯示最新版
+                st.session_state.pop("history_select", None)
             st.session_state.running = False
             if success:
                 switch_to_result_page("✅ AI 改寫完成！已切換至「② 改寫結果」查看", "🎉")
             st.rerun()
 
-    if st.session_state.result_text:
+    if _pending_refine_prompt:
+        st.session_state.running = True
+        progress_bar = result_progress_bar or st.progress(0, text="⏳ 二次精修中，請稍候…")
+        success, full_text = generate_with_progress(_pending_refine_prompt, selected_model, api_key, progress_bar, "二次精修")
+        if success:
+            st.session_state.result_text = full_text
+            chapter_label = st.session_state.get("chapter_id") or "手動輸入"
+            _tw_now2 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            _new_refine_entry = {
+                "ts":       _tw_now2.strftime("%m/%d %H:%M"),
+                "label":    f"{chapter_label}（精修）",
+                "text":     full_text,
+                "old_text": st.session_state.get("current_old_text_snapshot", ""),
+            }
+            st.session_state.rewrite_history = (
+                [_new_refine_entry] + list(st.session_state.rewrite_history)
+            )[:10]
+            st.session_state.pop("history_select", None)
+        st.session_state.pop("_pending_refine_prompt", None)
+        st.session_state.running = False
+        if success:
+            switch_to_result_page("✅ 精修完成！已更新「② 改寫結果」。", "🔄")
+        st.rerun()
+
+    if st.session_state.result_text and not _result_task_active:
         # ── 版本 + 模式 控制列（分欄擺放，視覺更整齊） ──
         ctrl1, ctrl2 = st.columns([3, 2])
         history = st.session_state.rewrite_history
@@ -1413,7 +1443,7 @@ with tab_result:
                 data=_html_content.encode("utf-8"),
                 file_name="未來線中運量_改寫結果.html",
                 mime="text/html", use_container_width=True)
-    else:
+    elif not _result_task_active:
         st.info("尚未產出結果。請至「① 輸入」分頁提供條文並執行改寫。")
 
 # ══════════════════════════════════════════════════════════
@@ -1462,51 +1492,7 @@ with tab_refine:
 - 不要輸出任何問候語或說明，直接輸出修改後的草稿
 - 一、改寫後條文 區塊內容必須乾淨，不得出現〔待確認〕、【建議刪除】等標記
 """
-                stream_box2 = st.empty()
-                retries, success, full_text = 3, False, ""
-                while not success and retries > 0:
-                    try:
-                        genai.configure(api_key=api_key)
-                        model = genai.GenerativeModel(selected_model)
-                        response = model.generate_content(refine_prompt, stream=True)
-                        full_text = ""
-                        _rc = 0
-                        for chunk in response:
-                            try:
-                                full_text += chunk.text
-                                _rc += 1
-                                if _rc % 6 == 0:
-                                    stream_box2.markdown(full_text + " ▌")
-                            except Exception:
-                                pass
-                        stream_box2.empty()
-                        st.session_state.result_text = full_text
-                        chapter_label = st.session_state.get("chapter_id") or "手動輸入"
-                        _tw_now2 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                        _new_refine_entry = {
-                            "ts":       _tw_now2.strftime("%m/%d %H:%M"),
-                            "label":    f"{chapter_label}（精修）",
-                            "text":     full_text,
-                            "old_text": st.session_state.get("current_old_text_snapshot", ""),
-                        }
-                        # 重新賦值（非 in-place insert），確保 Streamlit session_state 偵測到變更
-                        st.session_state.rewrite_history = (
-                            [_new_refine_entry] + list(st.session_state.rewrite_history)
-                        )[:10]
-                        # 清除歷史選單 session state，確保顯示最新精修版
-                        st.session_state.pop("history_select", None)
-                        success = True
-                    except Exception as e:
-                        err = str(e)
-                        if "429" in err or "quota" in err.lower():
-                            retries -= 1
-                            if retries > 0:
-                                st.warning(f"⚠️ 配額繁忙，15 秒後重試（剩餘 {retries} 次）...")
-                                time.sleep(15)
-                        else:
-                            st.error(f"❌ 錯誤：{err}"); break
-                if not success and retries == 0:
-                    st.error("❌ 已超過重試次數，請稍後手動重試。")
-                if success:
-                    switch_to_result_page("✅ 精修完成！已切換至「② 改寫結果」查看更新後內容。", "🔄")
-                    st.rerun()
+                st.session_state["_pending_refine_prompt"] = refine_prompt
+                switch_to_result_page("⏳ 已切換至「② 改寫結果」執行二次精修。", "🔄")
+                st.rerun()
+
